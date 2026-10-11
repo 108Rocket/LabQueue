@@ -1,0 +1,11 @@
+{
+  "name": "labqueue-course-tooling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned BMAD version used in the coursework slides",
+  "engines": { "node": ">=20.12.0" },
+  "scripts": {
+    "bmad:install": "bmad-method install --directory . --modules bmm --tools codex --user-name 108Rocket --communication-language Chinese --document-output-language Chinese --output-folder _bmad-output --yes"
+  },
+  "devDependencies": { "bmad-method": "6.12.1" }
+}

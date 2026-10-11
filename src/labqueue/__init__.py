@@ -1,0 +1,1 @@
+"""LabQueue coursework project."""

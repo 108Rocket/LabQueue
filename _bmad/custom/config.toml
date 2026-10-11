@@ -1,0 +1,6 @@
+# Durable team configuration; the installer preserves this directory.
+[core]
+project_name = "LabQueue"
+communication_language = "Chinese"
+document_output_language = "Chinese"
+output_folder = "_bmad-output"
