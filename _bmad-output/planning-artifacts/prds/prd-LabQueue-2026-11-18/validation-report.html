@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<!--
+  PRD Validation Report — skeleton template.
+
+  This file is a starter the synthesis pass fills in directly. There is no
+  substitution engine. The LLM:
+    1. Reads {doc_workspace}/review-rubric.md and every review-{slug}.md from
+       additional reviewers.
+    2. Copies this skeleton.
+    3. Replaces the placeholder content (everything between TEMPLATE markers)
+       with the consolidated review, preserving the structure and CSS.
+    4. Writes the result to {doc_workspace}/validation-report.html.
+    5. Writes a markdown twin to {doc_workspace}/validation-report.md.
+
+  Visual rules the LLM must preserve:
+    - The container width, the color tokens, the typography.
+    - One dimension = one collapsible <section class="dimension">.
+    - Verdict pill uses the verdict-* class matching its judgment.
+    - Severity badge uses the sev-* class matching its level.
+    - Each extra reviewer (adversarial, etc.) gets its own collapsible section
+      below the rubric dimensions.
+    - The footer always shows the artifact paths and timestamp.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LabQueue PRD 验证报告</title>
+<style>
+  :root {
+    --bg: #fafaf9;
+    --surface: #ffffff;
+    --border: #e7e5e4;
+    --text: #1c1917;
+    --muted: #78716c;
+
+    --verdict-strong: #16a34a;
+    --verdict-adequate: #65a30d;
+    --verdict-thin: #d97706;
+    --verdict-broken: #dc2626;
+
+    --sev-low: #64748b;
+    --sev-medium: #ca8a04;
+    --sev-high: #ea580c;
+    --sev-critical: #dc2626;
+
+    --grade-exc: #16a34a;
+    --grade-good: #65a30d;
+    --grade-fair: #d97706;
+    --grade-poor: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    font-size: 15px;
+  }
+  .container { max-width: 960px; margin: 0 auto; padding: 32px 24px 64px; }
+
+  header.report-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+  .title h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
+  .title .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .grade {
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-weight: 600;
+    color: white;
+    font-size: 15px;
+    white-space: nowrap;
+  }
+  .grade-excellent { background: var(--grade-exc); }
+  .grade-good { background: var(--grade-good); }
+  .grade-fair { background: var(--grade-fair); }
+  .grade-poor { background: var(--grade-poor); }
+
+  .synthesis {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--muted);
+    border-radius: 8px;
+    padding: 18px 22px;
+    margin-bottom: 24px;
+    font-size: 15.5px;
+  }
+  .synthesis p { margin: 0 0 10px; }
+  .synthesis p:last-child { margin-bottom: 0; }
+
+  .dimension-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-bottom: 24px;
+  }
+  .dim-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .dim-card .dim-name { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .dim-card .dim-verdict { font-size: 14px; font-weight: 600; }
+
+  section.dimension, section.reviewer-section { margin-bottom: 14px; }
+  section.dimension details, section.reviewer-section details {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  section summary {
+    padding: 14px 20px;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  section summary::-webkit-details-marker { display: none; }
+  section summary::before {
+    content: "▸";
+    display: inline-block;
+    color: var(--muted);
+    transition: transform 0.15s ease;
+  }
+  section details[open] summary::before { transform: rotate(90deg); }
+  section summary h2 {
+    display: inline;
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    flex: 1;
+  }
+  .verdict-pill {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: white;
+  }
+  .verdict-strong { background: var(--verdict-strong); }
+  .verdict-adequate { background: var(--verdict-adequate); }
+  .verdict-thin { background: var(--verdict-thin); }
+  .verdict-broken { background: var(--verdict-broken); }
+
+  .dim-body { padding: 4px 20px 18px; }
+  .dim-judgment { color: var(--text); font-size: 14.5px; }
+  .dim-judgment p { margin: 0 0 10px; }
+
+  .findings-list { padding: 0 20px 4px; }
+  article.finding {
+    padding: 14px 0;
+    border-top: 1px solid var(--border);
+  }
+  article.finding:first-child { border-top: none; }
+  article.finding header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+  .badge {
+    font-size: 10.5px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    line-height: 1.4;
+  }
+  .badge-sev-low { background: rgba(100, 116, 139, 0.12); color: var(--sev-low); }
+  .badge-sev-medium { background: rgba(202, 138, 4, 0.14); color: var(--sev-medium); }
+  .badge-sev-high { background: rgba(234, 88, 12, 0.14); color: var(--sev-high); }
+  .badge-sev-critical { background: rgba(220, 38, 38, 0.14); color: var(--sev-critical); }
+  .finding-title { margin: 0; font-size: 15px; font-weight: 500; flex: 1; min-width: 200px; }
+  .finding-location { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; color: var(--muted); }
+  .finding-note, .finding-fix { margin-top: 6px; font-size: 14px; }
+  .finding-fix strong { color: var(--muted); font-weight: 500; }
+
+  .reviewer-source {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  .mechanical {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-top: 24px;
+    font-size: 14px;
+  }
+  .mechanical h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .mechanical ul { margin: 0; padding-left: 20px; }
+  .mechanical li { margin-bottom: 4px; color: var(--text); }
+
+  footer.report-footer {
+    margin-top: 40px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  footer .meta { display: flex; gap: 24px; flex-wrap: wrap; }
+.verdict-text-strong { color: var(--verdict-strong); }
+.verdict-text-adequate { color: var(--verdict-adequate); }
+.verdict-text-thin { color: var(--verdict-thin); }
+.verdict-text-broken { color: var(--verdict-broken); }
+.evidence ul { margin: 0; padding-left: 1.4rem; }
+.evidence li + li { margin-top: 0.65rem; }
+.report-header .subtitle { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<div class="container">
+<header class="report-header"><div class="title"><h1>LabQueue PRD 验证报告</h1><div class="subtitle"><a href="prd.md">_bmad-output/planning-artifacts/prds/prd-LabQueue-2026-11-18/prd.md</a></div></div><div class="grade grade-fair">Fair</div></header>
+<div class="synthesis"><h2>总体结论</h2><p>四项模拟硬门槛均有可转成自动化测试的场景，两条 NFR 都有数值阈值和可采集的证据。FR-02 的时间优先排序在墙钟回拨时能颠倒系统确认顺序，FR-04 也未说明监测失效如何影响已领取、尚未启动确认的任务，这两个缺口应在相关验收口径确定前处理。现阶段结论基于文档，功能及 M1/M2 仍待验证。</p><p>四项模拟门槛和两条 NFR 均为文档级核对。当前仓库为环境骨架，模拟验收、NFR 和真实 L20 派发均无本次执行证据。</p></div>
+<div class="dimension-summary"><div class="dim-card"><div class="dim-name">决策就绪度</div><div class="dim-verdict verdict-text-thin">有缺口</div></div>
+<div class="dim-card"><div class="dim-name">内容实质</div><div class="dim-verdict verdict-text-strong">扎实</div></div>
+<div class="dim-card"><div class="dim-name">目标与范围一致性</div><div class="dim-verdict verdict-text-strong">扎实</div></div>
+<div class="dim-card"><div class="dim-name">验收清晰度</div><div class="dim-verdict verdict-text-thin">有缺口</div></div>
+<div class="dim-card"><div class="dim-name">范围透明度</div><div class="dim-verdict verdict-text-adequate">足够</div></div>
+<div class="dim-card"><div class="dim-name">下游可用性</div><div class="dim-verdict verdict-text-adequate">足够</div></div>
+<div class="dim-card"><div class="dim-name">文档形式适配</div><div class="dim-verdict verdict-text-strong">扎实</div></div></div>
+<section class="dimension">
+<details open>
+<summary><h2>决策就绪度</h2><span class="verdict-pill verdict-thin">有缺口</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>FR-02 写明“按系统确认入队时间升序排列”，复述了 D-001 已记录的排序表述，但缺少能兑现用户最新澄清的约束。FR-07 及 AC-07、AC-10 与 D-002 一致，保留了领取后、启动确认前的本人取消权，并定义两种确认顺序。</p></div></div>
+<div class="findings-list"><article class="finding"><header><span class="badge badge-sev-high">高</span><h3 class="finding-title">墙钟回拨会逆转全局 FIFO</h3><span class="finding-location"><a href="prd.md#提交查询与顺序">FR-02</a>、AC-01/02、<a href="../../../../decision-log.md">D-001</a></span></header><div class="finding-note">A 先由系统确认且时间为 10:00:05，回拨后 B 才确认且时间为 09:59:55。若直接用墙钟时间作主键，B 会先排队并先获准，以序号仅处理同时间的规则在此不起作用。建议把产品断言写为按系统确认顺序领取，由架构决定使用随成功确认严格递增且持久的全局序号，或能保证相同次序的逻辑确认键。序号须体现最终确认顺序，不能在并发提交开始时取号后任由确认顺序反转。建议用可控时钟覆盖回拨、同刻及并发确认，分别检查用户位置和释放单卡后的首次领取对象。</div></article>
+<article class="finding"><header><span class="badge badge-sev-high">高</span><h3 class="finding-title">监测失效发生在领取之后时缺少规则</h3><span class="finding-location"><a href="prd.md#资源准入与执行">FR-04/05</a>、FR-07、AC-04/05/08/10</span></header><div class="finding-note">AC-04 的前置条件为“无平台租约”，因此新增派发为 0 无法说明已有租约的执行方还能否确认或触发启动。请用户决定启动确认是否须重新取得当前有效观测，故障期间如何展示任务状态和原因，租约保留多久或在何种证明下撤销，以及撤销后是按原确认次序重排、重新确认入队还是结束为失败。恢复时同一 GPU 仍空闲、已被外部任务占用、其他 GPU 可用三条分支也需明确。建议优先比较启动前暂停并保留租约、确认从未启动后撤销租约的方案，分别权衡阻塞容量和恢复复杂度。FR-05 已约束实际执行状态未知时不能因超时就启动或重新分卡，FR-07 已约束启动确认前本人仍可取消，以及取消先成功时启动数为 0、租约解除，这两条作为补测的既定约束。</div></article></div>
+</details>
+</section>
+<section class="dimension">
+<details>
+<summary><h2>内容实质</h2><span class="verdict-pill verdict-strong">扎实</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>两条 NFR 各自给出三个必须为 0 的指标，并使用与调度恢复及跨用户隐私直接相关的故障注入和账号矩阵。性能指标保留候选状态，PRD 记录待定的阈值、负载和基线。</p></div></div>
+
+</details>
+</section>
+<section class="dimension">
+<details>
+<summary><h2>目标与范围一致性</h2><span class="verdict-pill verdict-strong">扎实</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>UJ-01 从双卡忙时排队到资源允许时获准和取得终态，贯穿 FR-01 至 FR-08。首版聚焦可重复的模拟闭环，FR-09/AC-12 将真实启动限制为经架构评审和服务器前置验证的条件目标。度量边界明确保留平台外占用的不确定性。</p></div></div>
+
+</details>
+</section>
+<section class="dimension">
+<details open>
+<summary><h2>验收清晰度</h2><span class="verdict-pill verdict-thin">有缺口</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>GATE-01（AC-01 至 AC-03）可断言跨组位置、等待原因、单卡释放后的获准和终态，以及未知显存、OOM 和租约释放。GATE-02（AC-04/05）可断言三类监测异常时无新增派发，并用恢复时交换占用的方式检查新观测确实驱动派发。GATE-03（AC-06 至 AC-08）可断言租约互斥、启动次数上限、取消与启动的两种确认顺序和超时但启动结果未知时的阻塞。GATE-04（AC-09 至 AC-11）可断言本人取消和越权请求拒绝、私有字段未泄露及目标状态未改变。各门槛仍需实现测试并采集实际结果。</p></div></div>
+<div class="findings-list"><article class="finding"><header><span class="badge badge-sev-medium">中</span><h3 class="finding-title">监测边界需要断言领取和启动两个事件</h3><span class="finding-location">AC-04/05/08/10</span></header><div class="finding-note">建议在 A 领取 GPU 1、B 排队、A 被确定性暂停在启动确认前时，依次注入监测失败、过期、外部占用不明，分别记录新领取、启动确认、模拟执行副作用、租约变化和用户可见原因。按用户选定规则断言故障期间 A 的确认与实际启动数、租约和恢复状态，并测恢复后同卡空闲、外部占用、仅另一卡可用。故障期间让 A 本人取消，再放行旧执行者重试，验证取消先成功时 A 启动 0 次且租约解除，监测未恢复时 B 新领取为 0。再变体让启动结果未知且跨越租约超时，断言未查清前无重复启动或同卡再分配。</div></article>
+<article class="finding"><header><span class="badge badge-sev-medium">中</span><h3 class="finding-title">一致性证据需要证明注入点确实发生且系统可推进</h3><span class="finding-location">AC-06、<a href="prd.md#可测非功能需求">NFR-01</a></span></header><div class="finding-note">建议用控制点记录领取成功、取消已确认但未响应、模拟启动已发生但无回执三个注入位置，关联恢复后的实际重放。用跨重启保留、可独立核查的执行器启动事件和租约历史，按任务 ID、GPU 稳定标识和租约 ID 对账。为 AC-06 加一个有效观测下必有一位胜出、任务能启动一次的正向断言，以发现全被阻塞但零冲突的假通过。对结果未知的窗口单独断言该卡新增派发为 0。</div></article>
+<article class="finding"><header><span class="badge badge-sev-medium">中</span><h3 class="finding-title">隐私证据需要落实出口和状态快照</h3><span class="finding-location">AC-11、NFR-02</span></header><div class="finding-note">建议用同组、异组、未认证及伪造身份请求覆盖已实现的列表、详情、取消及私有输出入口。每类字段放入独立合成标记，保存脱敏响应和请求前后的任务状态、顺序与租约摘要。本人能读标记且在启动确认前能取消作为正向对照，避免测试数据或入口缺失造成零泄露假象。</div></article></div>
+</details>
+</section>
+<section class="dimension">
+<details>
+<summary><h2>范围透明度</h2><span class="verdict-pill verdict-adequate">足够</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>首版范围和 AC-12 符合 PRD 工作区记忆记录及当前用户决定。模拟闭环为必做，真实 L20 派发有独立启用条件，GitHub 为唯一交付渠道，汇报、录屏和实验 B 排除。普通权限、提交者所属执行身份、外部任务不受平台强制管控和未知显存准入均保留。</p></div></div>
+<div class="findings-list"><article class="finding"><header><span class="badge badge-sev-medium">中</span><h3 class="finding-title">下游团队可能沿用较早的交付要求</h3><span class="finding-location"><a href="../../../../docs/course-requirements.md">课程要求</a>、<a href="../../../../README.md">README</a>、<a href="../../../../docs/team-allocation.md">分工方案</a></span></header><div class="finding-note">PRD 第 23 行已经体现用户决定。关联文件中仍出现 10 分钟录屏、最终演示与实验 B，课程文档末尾只覆盖部分变更。建议后续同步当前执行口径并给原始课件摘要标明出处。</div></article></div>
+</details>
+</section>
+<section class="dimension">
+<details>
+<summary><h2>下游可用性</h2><span class="verdict-pill verdict-adequate">足够</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>术语给出入队确认、有效观测、派发领取、平台租约和启动确认，FR 与 AC 的连接足以供架构及故事拆分。第 102 行明确区分实际启动边界和异步回执，支持后续取消裁决设计。需要在解决两个高优先级问题时明确将“派发”拆成是否领取、是否启动确认、是否发生执行副作用三种可观察事件，避免测试和状态机使用不同含义。</p></div></div>
+
+</details>
+</section>
+<section class="dimension">
+<details>
+<summary><h2>文档形式适配</h2><span class="verdict-pill verdict-strong">扎实</span></summary>
+<div class="dim-body"><div class="dim-judgment"><p>单条用户旅程为内部排队工具保留提交至终态的主路径，主要篇幅用于能力、边界与验收条件。团队可以从 FR、AC、NFR 抽取架构与故事输入，且真机依赖已被约束在条件目标。</p></div></div>
+
+</details>
+</section>
+<section class="dimension evidence"><details open><summary><h2>四项模拟门槛</h2></summary>
+<div class="dim-body"><ul><li><strong>GATE-01 · AC-01～03</strong> 具备正常路径、同时间决胜、成功和 OOM 的可断言脚本条件。用可控墙钟复现 A 先确认、B 在回拨后确认，核对位置 A=1、B=2。随后仅释放一张卡，断言 A 先领取。保留同时间用例，并补并行提交与重启后顺序一致性。</li>
+<li><strong>GATE-02 · AC-04～05</strong> 无租约时的三种监测异常和恢复后改用最新可用卡可直接转成测试。已领取、启动确认前的路径缺少产品预期。 AC-05 建议在首次领取前暂停调度来注入故障，恢复后只推进一个待领取任务，单独统计恢复窗口内的 1 次派发。</li>
+<li><strong>GATE-03 · AC-06～08</strong> 可用同步屏障驱动两个领取者争同一卡，分别固定取消先与启动先的顺序，并模拟启动结果未知及租约超时。AC-06 补至少一次成功领取和可控启动的正向断言，避免系统一直停摆也通过。</li>
+<li><strong>GATE-04 · AC-09～11</strong> 可覆盖排队中取消、已领取但未确认启动时取消、第三方越权。保留旧领取者重试，核对被取消任务启动数为 0、租约解除、B 只在有效观测下接手。</li></ul>
+</div>
+</details></section>
+<section class="dimension evidence"><details open><summary><h2>领取后监测失效 · 待用户决定</h2></summary>
+<div class="dim-body"><ul><li>启动边界。领取时的有效观测是否足够，还是启动确认前也必须重新取得有效观测？选择暂缓可避开沿用已失效观测带来的风险，同时会延迟任务启动。 真实派发仍受观测异常时停止新增派发的约束，启用前须明确启动确认是否属于这条约束的边界。</li>
+<li>租约和排位。若暂缓启动，是保留原租约等待复核，还是确认尚未开始后撤销领取？若撤销，任务是保留原确认顺序回队，还是进入用户可见的失败终态？保留租约需明确最长等待、超时后的核对和状态提示。回队需明确旧领取失效和 FIFO 排位。</li>
+<li>恢复条件。新观测显示原卡仍可用时，是否允许原领取继续？原卡已被外部进程占用、另一张卡空闲时，是等待原卡，还是按队列重新领取并允许换卡？同时确认 A、B 的可见状态和阻塞原因。</li></ul>
+</div>
+</details></section>
+<section class="dimension evidence"><details open><summary><h2>领取后监测失效 · 建议补测</h2></summary>
+<div class="dim-body"><ul><li>固定时序。让 A 持有效租约停在启动确认前、B 排队，分别注入监测报错、观测过期、外部占用不明，再放行原领取者并重试。断言异常期新增领取为 0、同卡至多一个有效平台租约、同任务至多一次启动。A 是否可启动以及租约、状态、位置的断言，按用户最终选定的策略填写。</li>
+<li>恢复分支。分别恢复为原卡仍可用、原卡已被外部占用且另一张卡可用。记录最新观测所指稳定 GPU 标识、实际领取顺序、各卡租约变化与 A/B 状态。若选择撤销并回队，重放旧领取的启动请求并验证其不能生效。</li>
+<li>取消与未知结果。异常期间安排 A 的所有者先于启动确认成功取消，断言 A 已取消、启动为 0、租约解除，旧领取者重试无效，B 在监测仍失效时领取为 0。另模拟启动请求已发出但结果未知、租约超时，断言状态核实前原任务新增启动数和原卡新增派发数都为 0。</li></ul>
+</div>
+</details></section>
+<section class="dimension evidence"><details open><summary><h2>两条 NFR 的取证</h2></summary>
+<div class="dim-body"><ul><li><strong>NFR-01 · 故障恢复一致性</strong> 可取证。分别在领取成功后、取消确认成功但响应前、模拟启动已记录但回执未到时中断并恢复。保存跨重启可核对的模拟执行器启动事件和有序租约事件，至少含任务 ID、GPU 稳定 ID、租约 ID 及事件顺序。逐例报告重复启动、同卡租约重叠、已取消任务启动三个 0。未知窗口另报告该卡新增派发为 0，并用正向对照证明故障钩子命中、状态明朗后可继续推进。</li>
+<li><strong>NFR-02 · 跨用户隐私隔离</strong> 可取证。为任务的命令、路径、环境和日志设置无敏感内容的唯一标记，使用同组非本人、异组、未认证和伪造身份请求覆盖列表、详情、取消及已实现的私有输出入口。保存脱敏响应和请求前后状态、队列位置与租约快照，逐例核对越权成功、标记泄露、未授权变更三个 0。用本人读取同一标记及合法取消作正向对照，并在证据中列清实际覆盖的入口。</li></ul>
+</div>
+</details></section>
+<section class="dimension evidence"><details open><summary><h2>用户决定与交付范围</h2></summary>
+<div class="dim-body"><ul><li>D-001 的旧记录以确认时间为主、同值按序号。当前 FR-02 复述了该记录。按本轮明确的确认事件先后验收，排序键必须随确认顺序递增。建议由系统在入队确认时赋予持久的全局顺序，墙钟时间供展示和审计。架构需保证顺序对应实际确认边界，预先取号后逆序确认也不能倒置 FIFO。</li>
+<li>D-002 由 FR-07、AC-07 和 AC-10 体现。启动确认前可取消。取消确认先成功时，启动数为 0 且已有租约解除。监测异常后的租约策略是另一个待确认事项。</li>
+<li>PRD 第 20–23、62–64、100 行与本轮范围一致。模拟闭环四项门槛及两条 NFR 为必达。真实 L20 派发需架构评审及服务器验证，AC-12 单独作条件验收。交付仅通过 GitHub，汇报、录屏、实验 B 在范围外。</li>
+<li>README 第 31、62 行、团队分工第 60–61 行以及课程要求转述仍留旧口径。产品简报第 80 行也把排序与取消边界列为待确认。后续同步这些入口时，以本轮范围与实际决策记录为准。</li></ul>
+<p><a href="prd.md">当前 PRD</a> · <a href=".memlog.md">PRD 工作记录</a> · <a href="../../../../decision-log.md">决策记录</a> · <a href="../../product-brief.md">产品简报</a> · <a href="../../../../docs/course-requirements.md">课程要求</a> · <a href="../../../../README.md">README</a> · <a href="../../../../docs/team-allocation.md">团队分工</a></p></div>
+</details></section>
+<div class="mechanical"><h3>文档检查记录</h3><ul><li>FR-01 至 FR-09、AC-01 至 AC-12、GATE-01 至 GATE-04、NFR-01 至 NFR-02 连续且唯一，条件验收 AC-12 独立。</li><li>UJ-01 以一名研究生描述简报中的等待经历，未使用姓名。单主角色的内部工具可保持此篇幅。</li><li>简报末尾仍把 FIFO 和取消边界列为待确认，需求追溯以 PRD 工作区记忆及 D-001、D-002 为准。墙钟回拨的最新澄清来自本轮用户请求。</li><li>本次为需求核对。现有环境检查记录没有调度业务接口，尚无模拟用例或 NFR 的实际运行证据。</li></ul></div>
+<section class="dimension evidence" id="targeted-recheck">
+<details open>
+<summary><h2>针对性复验（2026-11-18）</h2></summary>
+<div class="dim-body">
+<p>初验发现和等级按当时审阅的草稿保留。以下结论针对 D-003、D-004 写入后的 FR-02、FR-04、FR-07 和 AC-13～15，并参照 FR-05、AC-07、AC-08、AC-10 核对两条异常路径。<strong>本次只核对需求与验收文本。模拟测试尚未运行。</strong></p>
+<h3>初验缺口 1 · 全局 FIFO 被墙钟回拨打乱 · 文档层已关闭</h3>
+<p>FR-02 以持久化的全局入队序号体现实际确认顺序。AC-13 让 B 在回拨后确认，核对 A、B 的序号和排位，重启后再确认 C 并核对序号续增，最后释放单卡并断言 A 先领取。AC-15 按原序号让 A 先于 B 重新领取，与 FR-02 的回队规则一致。证据待模拟运行。</p>
+<h3>初验缺口 2 · 领取后监测失效缺少行为规则 · 部分关闭</h3>
+<p>FR-04 与 AC-14、AC-15 一致覆盖已核实未启动的任务。监测异常时阻断新领取和未确认的启动，撤销原领取并解除原租约，按原顺序回队。恢复后按最新有效观测换卡，旧领取在新租约生效后仍无法启动。以下两个分支尚缺直接验收断言，缺口未完全关闭。</p>
+<ul>
+<li><strong>取消先成功后重放恢复，未关闭。</strong> FR-02 要求取消成功的任务移出队列，FR-07 将其置为已取消且解除已有租约。FR-04 的回队条件只写了尚未通过启动确认及已核实未启动，未明确排除已取消终态。AC-14、AC-15 未覆盖恢复与取消的交错，AC-07、AC-10 也未重放监测恢复。建议明确恢复写入时须核验任务仍符合回队条件，已取消终态不可回队。补测让 A 已领取且监测失效，令取消先确认成功，再重放旧恢复和旧启动请求，随后恢复观测。断言 A 始终已取消、队列中无 A、新领取数和启动数为 0、有效租约数为 0，B 可在有效观测下领取。</li>
+<li><strong>启动结果未知后租约超时，未关闭。</strong> FR-04 只允许在核实未启动后走撤销回队分支。FR-04、FR-05 和 AC-08 约束核实前零重启、零重派，但 AC-08 只观察这两个结果。即使错误地提前释放租约，其他派发门槛也可能让测试得到两个零。建议明确超时后仍保留原租约对 GPU 的占用，直到执行结果得到核实。补测让 A 的启动结果未知且租约超时，再让监测恢复并报告 GPU 1 可用，保持 B 排队。核实前断言原租约释放事件为 0、该卡仍由原租约阻挡、A 未回队、A 新启动和该卡新增领取均为 0。</li>
+</ul>
+<p>本轮另已同步产品简报的 FIFO 与排队取消规则，以及 README、课程要求和团队分工的 GitHub 交付口径。实验 A 继续保留。</p>
+</div>
+</details>
+</section>
+<section class="dimension evidence" id="recheck-closure">
+<details open>
+<summary><h2>复验补记（2026-11-18）</h2></summary>
+<div class="dim-body"><ul>
+<li><strong>取消先成功后重放恢复，文档层关闭。</strong> FR-04 明确已取消任务不得回队。AC-14 增加取消先确认后重放旧恢复请求的变体，直接断言任务仍为已取消、队列中无该任务、模拟启动次数为 0。FR-07 的取消边界保持一致。</li>
+<li><strong>启动结果未知时保留 GPU，文档层关闭。</strong> FR-05 规定租约超时且监测恢复后，核实前仍保留该卡的平台占用。AC-08 直接检查保留仍在、解除事件为 0、该卡因保留不可重新分配，以及原任务新增启动次数为 0。</li>
+</ul>
+<p>这两个分支的需求及验收缺口均已在文档层关闭。模拟测试尚未运行，运行证据待补。</p>
+</div>
+</details>
+</section>
+<footer class="report-footer"><div class="meta"><a href="review-rubric.md">分维度评审</a><a href="../../../../.agents/skills/bmad-prd/assets/prd-validation-checklist.md">BMAD PRD rubric</a><time datetime="2026-11-18T16:31:12+08:00">2026-11-18T16:31:12+08:00</time></div></footer>
+</div>
+</body>
+</html>

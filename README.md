@@ -28,9 +28,11 @@ Set-Location 'F:\Postgraduate Eng\Homework\LabQueue'
 1. 在 Codex 中打开本仓库，开启新对话，调用 `bmad-help`。
 2. 根据 [产品简报草稿](_bmad-output/planning-artifacts/product-brief.md) 运行产品简报、PRD 工作流，人工评审后完成 M1。
 3. 运行架构、Epic/Story、项目上下文和实施准备检查，完成 M2，再开始故事实现。
-4. 每次工作流使用新对话，持续更新需求追溯、[真实决策记录](decision-log.md) 和迭代状态，完成实验 A、实验 B 及最终演示。
+4. 每次工作流使用新对话，持续更新需求追溯、[真实决策记录](decision-log.md) 和迭代状态，完成实验 A，并将可复现的验收证据与复盘纳入仓库。
 
-具体命令、课程门槛和交付清单见 [作业要求与流程](docs/course-requirements.md)。BMAD 技能在 AI 对话中调用，不是 PowerShell 命令。课程要求的 PRD、5 条 ADR、12 条 Story、两轮 Sprint 和实验结果仍需后续真实完成。
+作业仅通过 GitHub 仓库交付。不汇报、不录屏、不做实验 B，保留实验 A。
+
+具体命令、课程门槛和交付清单见 [作业要求与流程](docs/course-requirements.md)。BMAD 技能在 AI 对话中调用，不是 PowerShell 命令。PRD 已有草稿，团队评审待完成。5 条 ADR、12 条 Story、两轮 Sprint 和实验 A 结果仍需后续完成。
 
 ## 项目约束
 
@@ -53,6 +55,15 @@ Set-Location 'F:\Postgraduate Eng\Homework\LabQueue'
 
 ## 团队与 AI 使用声明
 
-团队要求 3–4 人；姓名、学号和分工待补充。当前已知 GitHub 维护者：108Rocket。
+团队共四人，主要负责人为 **108Rocket** 与 **Vamsinger**，另外两人暂称 **组员 A**、**组员 B**。分工方案如下，真实姓名、学号及课程登记信息待补充。
+
+| 成员 | 主责 | 计划工作量 |
+| --- | --- | --- |
+| Vamsinger | 产品需求、故事与冲刺、排队业务、范围取舍和业务验收 | 约 35% |
+| 108Rocket | 架构/ADR、GPU 资源与执行机制、环境、集成和部署 | 约 35% |
+| 组员 A | 交互与前端、页面验收和使用说明 | 约 15% |
+| 组员 B | 自动化验收与 NFR 测试、实验 A 取证、复盘数据和安装复现 | 约 15% |
+
+交付物负责人、四周安排、实验 A 分工及交叉评审见 [四人任务分工方案](docs/team-allocation.md)。比例是未来投入安排，不代表已完成贡献；具体开发任务在 PRD 与架构评审后拆分。当前已知 GitHub 维护者为 108Rocket。
 
 本次环境骨架和文档由用户与 Codex 协作生成。BMAD 版本固定为 6.12.1；具体 AI 模型名称、版本、日期及各阶段用途请按实际界面和工作记录补充。本仓库保留真实人工约束和决策，不填造实验数据、评审结论或 AI 拒绝次数。
