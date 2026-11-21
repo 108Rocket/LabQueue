@@ -45,6 +45,28 @@
 
 **修订关系**　D-010 明确 D-009 的「再次取消」指用户在入口恢复后主动使用新 ID 发起取消。旧 ID 只能核对既有处理事实，不重新裁决。
 
+## M2 UX 人工评审证据
+
+Vamsinger 对初稿的 Q3 提出实质修改。原草稿两页统一使用「启动状态待核对，取消尚未确认」。评审指出从未发起取消时只应说明启动待核对，避免暗示有人发起取消。改动已落实到本地两页状态行及流程，走查区分了有无取消请求并核对取消终态。依据 FR-03、FR-05、FR-07 / AC-07、AC-08、AC-10，服务端行为待模拟验证。[首轮评审意见](https://github.com/108Rocket/LabQueue/pull/2#issuecomment-7009392929) · [PR #2 修订](https://github.com/108Rocket/LabQueue/commit/2d9a2e8e92d14116035c44d70b485ef013eda049)。
+
+### 2026-11-21 · 按 D-010、D-011 修订 UX
+
+Vamsinger 在 PR #2 给出取消入口恢复和两页乱序的验收判据。GitHub `main@74e41b9` 的决策日志记录了人工采纳及 AD-4、AD-2 与 Story 的追溯。[Vamsinger 的复审](https://github.com/108Rocket/LabQueue/pull/2#issuecomment-7034143807) · [main 决策日志](https://github.com/108Rocket/LabQueue/blob/74e41b95b422e886a143320ed500b014c6d58b86/decision-log.md) · [架构](https://github.com/108Rocket/LabQueue/blob/74e41b95b422e886a143320ed500b014c6d58b86/_bmad-output/planning-artifacts/architecture.md) · [Story](https://github.com/108Rocket/LabQueue/blob/74e41b95b422e886a143320ed500b014c6d58b86/_bmad-output/planning-artifacts/epics.md)
+
+| 决策 | 实际修改 | 本地文档走查 |
+| --- | --- | --- |
+| D-010 · 取消入口恢复 | 在 EXPERIENCE.md、列表与详情线框和取消流程中写明普通刷新只读、本人主动核对、持久封存或原请求终局，以及同一份完整快照仍可取消后才恢复按钮。再次取消由本人操作并使用新请求 ID。FR-05、FR-07 / AC-07、AC-10、NFR-01，AD-4 / Story 3.1–3.3。 | 已核对超时查无记录、受理先提交、封存后入口恢复，以及恢复后发出新请求前迟到并重放的旧请求不能改变任务、租约、取消记录与版本。运行验收待执行。 |
+| D-011 · 共享页面快照版本 | 在 EXPERIENCE.md、线框与页面更新流程中写明两页共享版本下限，旧画面标「上次确认」，仅含取消结果的回执按请求核对。提高下限后等待达标的完整快照。FR-02、FR-03、FR-04、FR-07 / AC-02、AC-07、AC-13、AC-14，AD-2 / Story 1.2、3.2、4.2。 | 已分别走查列表和详情的队位 2→1、已取消后旧响应晚到、较新的原序回队三组输入顺序，并核对跨页旧缓存和局部回执。运行验收待执行。 |
+| D-007 · 原序回队 | 已查到主线正文。回队事务须证实未通过启动确认、未实际启动且未取消。UX 在回队提交后使用完整快照展示按原序重算的当前队位、等待原因与取消资格。FR-02、FR-03、FR-04 / AC-13 至 AC-15，AD-6 / Story 4.2。 | 已对照决策日志和架构，核对较新的回队快照能更新页面，旧恢复结果不能覆盖已取消。 |
+
+已检查四张 Mermaid 流程图的节点引用、五个文本框宽度和 `git diff --check`。UX 待人工复核。「核对取消请求」的文案与确认步骤见下方候选。模拟和真实 L20 验证待执行。
+
+#### 核对确认框候选 · AI 代理取舍
+
+「我」聊天转达了待评审的交互取舍。取消结果未知时，详情保留只读的「刷新状态」。点「核对取消请求」先打开确认框，说明尚未受理的旧请求在继续核对后可能被阻止生效，已受理的请求会继续处理。打开、返回或关闭只改变界面。只有「继续核对」发送命令。候选已同步至 [交互说明](_bmad-output/planning-artifacts/ux-designs/ux-LabQueue-2026-11-19/EXPERIENCE.md#核对确认框候选) 和 [详情线框与流程](_bmad-output/planning-artifacts/ux-designs/ux-LabQueue-2026-11-19/wireframes.md#三页框图)。FR-05、FR-07 / AC-07、AC-10，D-010、D-011 / AD-4、AD-2 / Story 3.1–3.3。
+
+本地文档走查核对了打开、返回、关闭和确认四条路径。受理已先提交且尚无终局时，显示「取消请求处理中」，旧请求继续处理，取消入口保持关闭；已有终局时按完整快照反馈。核对了四张流程图的节点引用、六个文本框的宽度及 `git diff --check`。候选仍待人工评审，运行验收待执行。
+
 ## 后续真实决策模板
 
 ```markdown
