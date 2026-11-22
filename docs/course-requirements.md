@@ -19,7 +19,7 @@ LabQueue 可重点分析同卡重复分配、任务重复领取、取消与启�
 | `architecture.md` | 至少 5 条 ADR，每条有否决方案及理由 | 已有草案，待评审 |
 | `epics.md` + Story | 至少 12 条；验收条件可直接转为断言 | 已有草案，待评审 |
 | `project-context.md` | 栈和版本，至少 8 条具体实现规则 | 草稿已同步当前 ADR、Story 与决策，待人工签核 |
-| `sprint-status.yaml` | 纳入 Git，真实多次更新 | 门禁后生成 |
+| `sprint-status.yaml` | 纳入 Git，真实多次更新 | 规划就绪 PASS 后已生成并验证，Story 均为 backlog。见 [Sprint 状态](../_bmad-output/implementation-artifacts/sprint-status.yaml)。 |
 | 源码 + 测试 | README 可运行，每条 NFR 有测试证据 | 只有环境骨架，功能/NFR 未验证 |
 | `decision-log.md` | 至少 15 条，至少 5 条真实否决或实质修改 AI 输出 | 已有真实约束及 D-001 至 D-011，数量要求未完成 |
 | `retrospective.md` | 度量表、实验 A 结论 | 空白记录模板 |
@@ -54,7 +54,7 @@ LabQueue 可重点分析同卡重复分配、任务重复领取、取消与启�
 - 第 3 周：周五 M3，核心 Epic 可运行，验收证据纳入仓库。
 - 第 4 周：完成剩余 Story、实验 A、复盘；周五 M4，通过 GitHub 交付并封存仓库，以最后一次提交为准。
 
-M1/M2 不计分但必须通过，课程规定未通过不能进入功能实施。当前应用仍是环境骨架，规划材料已进入评审，门禁未通过。文档核对和生成器预演见 [M2 就绪预检](../_bmad-output/planning-artifacts/m2-readiness-preflight.md)。课程开课日期未知，不能凭本机日期推算四个截止日。
+M1/M2 不计分但必须通过，课程规定未通过不能进入功能实施。当前应用仍是环境骨架。模拟首版规划就绪已判为 PASS，课程 M1/M2 签核仍待人工。文档核对、跟踪生成和验证见 [M2 就绪预检](../_bmad-output/planning-artifacts/m2-readiness-preflight.md)。课程开课日期未知，不能凭本机日期推算四个截止日。
 
 ## 实验 A（第 34 页）
 

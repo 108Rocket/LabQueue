@@ -8,10 +8,20 @@
 | 架构 | AD-1 至 AD-8 均给出否决方案及理由。AD-4／AD-6 已记录原报告 B1 的待核对和回队裁决，见 D-005、D-007；AD-4／AD-5 已记录 B2 的观测到期与启动提交顺序，见 D-006。B3 仅阻塞真实 L20 启用。 | 团队签核当前架构版本。原 Validate 报告保留当时的结论，模拟测试结果另行记录。 |
 | 工作拆分 | 4 个 Epic、16 个 Story；Story 1.2 和 1.3 的跨 Story 断言已标为联调验收，4.6 汇总跨重启证据。两条 NFR 都有量化断言和 Story 归属。核对验收索引覆盖全部 14 条模拟 AC，各门槛所列 Story 均存在。条件 AC-12 另由 FR-09、AD-8 追溯。 | 复核同一候选版本中的页面验收及待定交互。 |
 | 项目上下文 | 记录栈、版本及 13 条实施规则。规则 2、6 已吸收 D-011、D-010。 | 仅在收到对应评审结论后据实更新评审标志。 |
-| UX | PR #2 的 D-010、D-011 答复已进入本地 UX 候选并完成两页文档走查，工作拆分已链接到候选稿。 | 人工复核确认框、统一访问反馈和原提交手动重试候选，确认提交字段及显存单位，并将评审后的 UX 修订纳入评审分支。 |
-| Sprint 跟踪 | BMAD 生成器 `--dry-run` 成功识别 4 个 Epic、16 个 Story，无解析警告。预览为 20 个 `backlog` 条目和 4 个 `optional` 复盘条目。 | 在同一候选版本上完成正式 readiness。门禁通过后生成并验证 `sprint-status.yaml`，按真实 Git 流程纳入仓库。 |
+| UX | PR #2 的 D-010、D-011 答复已进入本地 UX 候选并完成两页文档走查，工作拆分已链接到候选稿。 | 人工复核确认框、统一访问反馈和原提交手动重试候选，按 Story 1.1 走查模拟首版的提交字段和 GiB 单位。 |
+| Sprint 跟踪 | 规划门禁 PASS 后已生成并验证 [Sprint 状态](../implementation-artifacts/sprint-status.yaml)。4 个 Epic、16 个 Story 均为 `backlog`，4 个复盘为 `optional`。 | 等待课程签核后再启动功能实施，按真实状态更新跟踪。 |
 
 资料：[UX 交互说明](ux-designs/ux-LabQueue-2026-11-19/EXPERIENCE.md) · [线框与流程](ux-designs/ux-LabQueue-2026-11-19/wireframes.md) · [PRD](prds/prd-LabQueue-2026-11-18/prd.md) · [架构](architecture.md) · [原 Validate 报告](architecture-validation-2026-11-18/validation-report.md) · [工作拆分](epics.md) · [项目上下文](../project-context.md) · [决策日志](../../decision-log.md) · [PR #2 架构答复](https://github.com/108Rocket/LabQueue/pull/2#issuecomment-7034143807)。
+
+## 规划就绪结论 · 2026-11-22
+
+**PASS（模拟首版规划）**。需求、事务裁决、页面状态和工作拆分已可追溯到同一候选。交叉依赖的断言标为联调验收，Story 可先完成各自的独立验收。FR-09／AC-12 属于另行启用的条件目标。
+
+- 复核 M2 候选及本地合并基线 `bd01790`。4 个 Epic、16 个 Story、8 条 ADR、9 条 FR、2 条 NFR、14 条模拟 AC 均已核对，验收索引引用的 Story 均存在。检查通过 40 个本地文档链接和 6 个文本线框。
+- 保留 Story 1.1 的模拟表单默认值。任务名与执行命令作为任务数据，显存可选未知或用 GiB 填写正数。线框和交互说明已补齐空值或非正数的反馈。保留首轮评审表的换行修复和验收补充。
+- 2026-11-22 10:31（UTC+08:00） 用 BMAD `sprint_plan.py generate` 从 `epics.md` 实际生成 Sprint 状态，`validate` 为有效，`status` 读到 4 个 Epic 和 16 个 Story 均为 `backlog`，4 个复盘为 `optional`。[Sprint 状态](../implementation-artifacts/sprint-status.yaml)
+
+课程 M1／M2 签核仍待人工，UX 文案与交互候选仍待复核。功能模拟验收待执行，真实 L20 保持禁用。
 
 ## 评审抽查路径
 
