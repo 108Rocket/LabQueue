@@ -1,0 +1,64 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 11-22-2026 10:31
+last_updated: 11-22-2026 10:31
+project: LabQueue
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+development_status:
+  epic-1: backlog
+  1-1-由可信身份提交任务: backlog
+  1-2-跨组按确认顺序排队并查看位置: backlog
+  1-3-隔离任务详情-私有输出和取消权限: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-等待有效观测并按最新快照恢复派发: backlog
+  2-2-原子领取队首和单卡租约: backlog
+  2-3-让一次启动确认只产生一次模拟启动: backlog
+  2-4-查看完成或失败并释放租约: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-取消尚未领取的排队任务: backlog
+  3-2-裁决已领取任务的取消与启动竞争: backlog
+  3-3-启动事实未知时保留原卡-证据恢复后按事实裁决: backlog
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-按提交顺序裁决观测到期与启动: backlog
+  4-2-核实未启动后原序回队-阻止后到任务越过: backlog
+  4-3-旧领取在原租约保留和重新领取后都不可重放: backlog
+  4-4-待核对记录写入失败后保持准入关闭: backlog
+  4-5-取消抢先提交后-迟到的恢复不能使任务回队: backlog
+  4-6-用崩溃重放验证一致性门槛: backlog
+  epic-4-retrospective: optional
