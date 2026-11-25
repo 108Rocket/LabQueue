@@ -1,4 +1,4 @@
-"""任务提交、幂等重放和只读核对。"""
+"""任务提交、模拟领取、幂等重放和只读核对。"""
 
 import sqlite3
 from contextlib import closing
@@ -11,13 +11,24 @@ from uuid import UUID, uuid4
 from pydantic import UUID4, BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from labqueue.auth import Account
+from labqueue.leases import (
+    ClaimBlocked,
+    ClaimCommitUnknown,
+    ClaimedLease,
+    ClaimResult,
+    dispatch_options,
+    initialize_leases,
+    read_claim,
+    record_claim,
+)
 from labqueue.observations import (
     SimulatedObservations,
     WaitingReason,
     initialize_observations,
     read_admission,
+    read_admission_for_claim,
 )
-from labqueue.storage import prepare_storage, verify_storage
+from labqueue.storage import prepare_storage, rollback_open_transaction, verify_storage
 
 LOCK_WAIT_SECONDS = 2
 
@@ -53,7 +64,7 @@ class TaskView(BaseModel):
     queued_at: datetime
     status: str
     queue_position: int | None
-    waiting_reason: WaitingReason | None
+    waiting_reason: WaitingReason | Literal["requeue_required"] | None
     can_cancel: Literal[False] = False
 
 
@@ -154,11 +165,60 @@ class SubmissionStore:
                     UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1;
                 END;
                 """)
+            initialize_leases(db)
             publisher = SimulatedObservations(
                 self._connect, self._connect_readonly, *initialize_observations(db)
             )
             publisher.commit_rotation(db)
         return publisher
+
+    def claim_head(self) -> ClaimResult:
+        """仅供应用进程内受信任的模拟调用。"""
+        try:
+            return self._claim_head()
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_BUSY:
+                raise
+            return self._claim_head()
+
+    def _claim_head(self) -> ClaimResult:
+        result: ClaimResult
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                admission = read_admission_for_claim(db)
+                options = dispatch_options(db, admission)
+                if options.head_task_id is None:
+                    result = ClaimBlocked("queue_empty")
+                elif options.gpu_uuid is None:
+                    result = ClaimBlocked(options.waiting_reason)
+                else:
+                    result = record_claim(
+                        db, options.head_task_id, options.gpu_uuid, admission.admission_generation
+                    )
+            except BaseException:
+                rollback_open_transaction(db)
+                raise
+
+            try:
+                db.execute("COMMIT")
+            except sqlite3.Error as error:
+                if rollback_open_transaction(db):
+                    raise
+                commit_error = error
+            else:
+                return result
+
+        claim_id = result.claim_id if isinstance(result, ClaimedLease) else None
+        if claim_id is not None:
+            try:
+                with closing(self._connect_readonly()) as db:
+                    committed = read_claim(db, claim_id)
+            except (sqlite3.Error, OSError) as error:
+                raise ClaimCommitUnknown(claim_id) from error
+            if committed is not None and committed == result:
+                return committed
+        raise ClaimCommitUnknown(claim_id) from commit_error
 
     def list_tasks(self, account: Account) -> TaskListSnapshot:
         version, tasks, _ = self._task_snapshot(account, task_id=None)
@@ -203,7 +263,7 @@ class SubmissionStore:
             version = db.execute(
                 "SELECT snapshot_version FROM queue_state WHERE id = 1"
             ).fetchone()[0]
-            reason = read_admission(db).waiting_reason
+            reason = dispatch_options(db, read_admission(db)).waiting_reason
             if task_id is None:
                 rows = db.execute(
                     """WITH ranked AS (

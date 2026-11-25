@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -33,6 +34,18 @@ foreach ($path in (ConvertFrom-Json ([Console]::In.ReadToEnd()))) {
     if ([IO.Directory]::Exists($path) -and -not $inheritFiles) { exit 1 }
 }
 """
+
+
+def rollback_open_transaction(db: sqlite3.Connection) -> bool:
+    """只在能确认开放事务已回滚时返回真。"""
+    try:
+        if db.in_transaction:
+            db.execute("ROLLBACK")
+            return True
+    except sqlite3.Error:
+        # 原连接可能已关闭，提交结果须从持久状态核对。
+        pass
+    return False
 
 
 def default_database() -> Path:
