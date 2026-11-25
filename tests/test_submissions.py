@@ -6,18 +6,25 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
+from typing import Annotated
 from uuid import uuid4
 
 import pytest
+from fastapi import Depends, HTTPException
 from fastapi.testclient import TestClient
 
 import labqueue.submissions as submissions
-from labqueue.app import create_app
+from labqueue.app import create_app, require_csrf
+from labqueue.auth import VIEW_SCOPE_COOKIE, Session
 from labqueue.storage import default_database, verify_storage
 from labqueue.submissions import SubmissionStore
 
 BASE_URL = "http://127.0.0.1"
-ACCOUNT_PASSWORDS = {"demo-a": "synthetic-demo-a", "demo-b": "synthetic-demo-b"}
+ACCOUNT_PASSWORDS = {
+    "demo-a": "synthetic-demo-a",
+    "demo-a-peer": "synthetic-demo-a-peer",
+    "demo-b": "synthetic-demo-b",
+}
 
 
 @pytest.fixture
@@ -483,6 +490,142 @@ def test_task_pages_and_api_are_owner_scoped(client):
     for api_path in ("/api/tasks", path):
         old_page = client.get(api_path, headers=headers)
         assert old_page.status_code == 403 and set(old_page.json()) == {"detail"}
+
+
+def test_private_output_and_tasks_require_the_trusted_owner(client, database):
+    name = "synthetic-name-13"
+    command = "synthetic-command-13"
+    output_text = "synthetic-path-13\nsynthetic-env-13\nsynthetic-log-13"
+    markers = (name, command, *output_text.splitlines())
+    owner = login(client)
+    initial_scope = client.cookies[VIEW_SCOPE_COOKIE]
+    task_id = api_submit(client, owner, name=name, command=command)["task_id"]
+    detail = f"/api/tasks/{task_id}"
+    without_output = client.get(detail, headers=owner).json()
+    assert "output_id" not in without_output
+    output_id = str(uuid4())
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("INSERT INTO task_outputs VALUES (?, ?, ?)", (output_id, task_id, output_text))
+    output = f"{detail}/outputs/{output_id}"
+    missing_task = f"/api/tasks/{uuid4()}"
+    missing_output = f"{detail}/outputs/{uuid4()}"
+    with_output = client.get(detail, headers=owner).json()
+    assert with_output["output_id"] == output_id
+    assert int(with_output["snapshot_version"]) == int(without_output["snapshot_version"]) + 1
+    assert with_output["task"] == without_output["task"]
+    assert client.get(output, headers=owner).json() == {"text": output_text}
+    assert client.get(output, headers=owner).headers["Cache-Control"] == "no-store"
+    assert client.get(missing_output, headers=owner).status_code == 404
+    another_id = api_submit(client, owner)["task_id"]
+    swapped = client.get(f"/api/tasks/{another_id}/outputs/{output_id}", headers=owner)
+    assert swapped.status_code == 404
+    assert swapped.json() == client.get(missing_output, headers=owner).json()
+
+    before = state(database)
+    forged_fields = {"owner_id": "demo-a", "group_id": "group-a", "task_id": task_id}
+    for account in ("demo-a-peer", "demo-b", None):
+        if account is None:
+            client.cookies.clear()
+            authenticated = {}
+        else:
+            authenticated = login(client, account)
+            assert client.cookies[VIEW_SCOPE_COOKIE] != initial_scope
+            group = "group-a" if account == "demo-a-peer" else "group-b"
+            assert f"{account} · {group}" in client.get("/tasks").text
+        for forged in (False, True):
+            headers = dict(authenticated)
+            if forged:
+                headers.update({"X-Owner-Id": "demo-a", "X-Group-Id": "group-a"})
+            for path in ("/api/tasks", detail, output):
+                response = client.get(path, params=forged_fields if forged else {}, headers=headers)
+                if account is None:
+                    assert response.status_code == 401
+                elif path == "/api/tasks":
+                    assert response.status_code == 200
+                    assert response.json()["tasks"] == []
+                else:
+                    assert response.status_code == 404
+                    absent_path = missing_task if path == detail else missing_output
+                    assert response.json() == client.get(absent_path, headers=headers).json()
+                assert response.headers["Cache-Control"] == "no-store"
+                assert all(marker not in response.text for marker in markers)
+                assert output_id not in response.text
+        # 可读的页面范围 Cookie 也不参与服务端授权。
+        client.cookies.set(VIEW_SCOPE_COOKIE, initial_scope, domain="127.0.0.1", path="/")
+        assert client.get(output, headers=authenticated).status_code == (404 if account else 401)
+        page = client.get(f"/tasks/{task_id}")
+        assert all(marker not in page.text for marker in markers)
+    assert state(database) == before
+
+
+def test_view_scope_tracks_login_switch_and_logout(client):
+    owner = login(client)
+    scope = client.cookies[VIEW_SCOPE_COOKIE]
+    assert f'data-snapshot-scope="{scope}"' in client.get("/tasks").text
+    task_id = api_submit(client, owner)["task_id"]
+    output = f"/api/tasks/{task_id}/outputs/{uuid4()}"
+    new_session = login(client, "demo-b")
+    assert client.cookies[VIEW_SCOPE_COOKIE] != scope
+    assert client.get(output, headers=owner).status_code == 403
+    assert client.delete("/api/session", headers=new_session).status_code == 204
+    assert client.cookies.get(VIEW_SCOPE_COOKIE) is None
+
+
+def test_cancel_authorization_with_transactional_test_double(database):
+    app = create_app(database)
+    store = SubmissionStore(database)
+    mutations = []
+
+    @app.post("/_test/cancel/{task_id}", status_code=204)
+    def cancel_double(task_id: str, session: Annotated[Session, Depends(require_csrf)]):
+        with closing(store._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not store.owns_task(db, session.account, task_id):
+                raise HTTPException(404, "未找到该任务。")
+            mutations.append(task_id)
+            db.execute("UPDATE tasks SET status = 'test-double' WHERE task_id = ?", (task_id,))
+            db.execute("""
+                UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1
+                """)
+            db.execute("DELETE FROM test_leases WHERE task_id = ?", (task_id,))
+            db.execute("COMMIT")
+
+    def leases():
+        with closing(sqlite3.connect(database)) as db:
+            return db.execute("SELECT * FROM test_leases").fetchall()
+
+    with TestClient(app, base_url=BASE_URL) as client:
+        owner = login(client)
+        task_id = api_submit(client, owner)["task_id"]
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("CREATE TABLE test_leases (gpu_id TEXT, task_id TEXT)")
+            db.execute("INSERT INTO test_leases VALUES ('synthetic-gpu-1', ?)", (task_id,))
+        path = f"/_test/cancel/{task_id}"
+        assert client.post(f"/api/tasks/{task_id}/cancel", headers=owner).status_code == 404
+        before = state(database), leases()
+        assert client.post(path).status_code == 403
+        assert client.post(path, headers={"X-CSRF-Token": "wrong"}).status_code == 403
+
+        for account in ("demo-a-peer", "demo-b", None):
+            if account is None:
+                client.cookies.clear()
+                headers = {}
+            else:
+                headers = login(client, account)
+            for claimed_identity in ({}, {"owner_id": "demo-a", "group_id": "group-a"}):
+                denied = client.post(path, headers=headers, json=claimed_identity)
+                assert denied.status_code == (401 if account is None else 404)
+                assert denied.json() == {
+                    "detail": "请先登录合成账号。" if account is None else "未找到该任务。"
+                }
+        assert mutations == []
+        assert (state(database), leases()) == before
+        assert client.post(path, headers=login(client)).status_code == 204
+        assert mutations == [task_id]
+        (task,), (sequence, version) = state(database)
+        assert task[-2:] == ("test-double", sequence)
+        assert (sequence, version) == (1, 2)
+        assert leases() == []
 
 
 @pytest.mark.parametrize("view", ["list", "detail", "foreign"])

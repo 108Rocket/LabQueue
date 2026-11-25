@@ -5,9 +5,10 @@ const { setImmediate: settle } = require("node:timers/promises");
 const { test } = require("node:test");
 const { runInNewContext } = require("node:vm");
 
-const scripts = ["submission.js", "tasks.js"].map((file) =>
+const [submissionScript, tasksScript] = ["submission.js", "tasks.js"].map((file) =>
   readFileSync(join(__dirname, "../src/labqueue/static", file), "utf8")
-).join("\n");
+);
+const scripts = `${submissionScript}\n${tasksScript}`;
 const taskId = "83f45969-1db4-4ac7-91c7-c16f361baf16";
 const versionKey = "labqueue.task-version.test-session";
 const task = {
@@ -17,7 +18,8 @@ const task = {
 
 function snapshot(detail, version, changes = {}) {
   const row = { ...task, ...changes };
-  return detail ? { snapshot_version: version, task: row } : { snapshot_version: version, tasks: [row] };
+  return detail ? { snapshot_version: version, task: row }
+    : { snapshot_version: version, tasks: [row] };
 }
 
 function makeSharedVersionStore() {
@@ -38,16 +40,25 @@ function makeSharedVersionStore() {
       return work;
     },
   };
-  return { values, locks, heldLocks, available: true };
+  const tabs = new Set();
+  return {
+    values, locks, heldLocks, available: true, cookie: "labqueue_view_scope=test-session",
+    tabs,
+    signal(source, key) {
+      for (const tab of tabs) if (tab !== source) tab.fire("storage", { key });
+    },
+  };
 }
 
-function makePage(detail, shared = makeSharedVersionStore()) {
+function makePage(detail, shared = makeSharedVersionStore(), scope = "test-session") {
   const makeElement = (tag) => {
     const handlers = new Map();
     return {
       tag, children: [], textContent: "", dataset: {},
       append(...children) { this.children.push(...children); },
       replaceChildren(...children) { this.children = children; },
+      contains(node) { return this === node || this.children.some((child) => child.contains(node)); },
+      setAttribute() {},
       addEventListener(type, handler) { handlers.set(type, handler); },
       fire(type, event) { return handlers.get(type)(event); },
     };
@@ -55,16 +66,24 @@ function makePage(detail, shared = makeSharedVersionStore()) {
   const elements = new Map(["session", "logout", "session-feedback", "tasks-page", "refresh-tasks",
     "tasks-feedback", "task-results"].map((id) => [id, makeElement(id)]));
   elements.get("session").dataset.csrf = "test-csrf-token";
-  elements.get("tasks-page").dataset.snapshotScope = "test-session";
+  elements.get("tasks-page").dataset.snapshotScope = scope;
   if (detail) elements.get("tasks-page").dataset.taskId = taskId;
   const pageWindow = makeElement("window");
+  pageWindow.location = { reload() {} };
+  let checkInterval;
+  pageWindow.setInterval = (callback) => { checkInterval = callback; };
+  shared.tabs.add(pageWindow);
   const fetches = [];
+  const document = makeElement("document");
+  Object.assign(document, {
+    getElementById: (id) => elements.get(id) || null,
+    createElement: makeElement,
+    createDocumentFragment: () => makeElement("fragment"),
+    visibilityState: "visible",
+  });
+  Object.defineProperty(document, "cookie", { get: () => shared.cookie });
   runInNewContext(scripts, {
-    document: {
-      getElementById: (id) => elements.get(id) || null,
-      createElement: makeElement,
-      createDocumentFragment: () => makeElement("fragment"),
-    },
+    document,
     navigator: { locks: shared.locks },
     localStorage: {
       getItem(key) {
@@ -73,19 +92,21 @@ function makePage(detail, shared = makeSharedVersionStore()) {
         return shared.values.get(key) ?? null;
       },
       setItem(key, value) {
+        if (key === "labqueue.session-change") return shared.signal(pageWindow, key);
         assert.ok(shared.heldLocks.has(key));
         if (!shared.available) throw new Error("storage unavailable");
         shared.values.set(key, value);
       },
     },
-    window: pageWindow, AbortSignal,
+    window: pageWindow, AbortSignal, crypto: require("node:crypto").webcrypto,
     fetch(path, options) {
-      assert.equal(path, detail ? `/api/tasks/${taskId}` : "/api/tasks");
-      assert.equal(options.method, "GET");
       assert.equal(options.headers["X-CSRF-Token"], "test-csrf-token");
       assert.ok(options.signal instanceof AbortSignal);
-      return new Promise((resolve) => fetches.push((body, status = 200) => {
-        resolve({ status, ok: status === 200, json: async () => body });
+      return new Promise((resolve, reject) => fetches.push({ path, method: options.method,
+        reply(body, status = 200) {
+          resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
+        },
+        interrupt() { reject(new TypeError("Synthetic network interruption")); },
       }));
     },
   });
@@ -98,9 +119,15 @@ function makePage(detail, shared = makeSharedVersionStore()) {
   }
   return {
     refresh: () => elements.get("refresh-tasks").fire("click"),
+    logout: () => elements.get("logout").fire("click"),
+    readOutput: () => elements.get("task-results").children[0].children[0].children
+      .find((child) => child.tag === "button").fire("click"),
     fire: (event, fields) => pageWindow.fire(event, fields),
-    reply: (index, ...args) => fetches[index](...args),
+    checkSession: () => checkInterval(),
+    fetches,
+    reply: (index, ...args) => fetches[index].reply(...args),
     rows: () => textOf(elements.get("task-results")),
+    hidden: () => elements.get("task-results").hidden,
     links: () => linksOf(elements.get("task-results")),
     feedback: () => textOf(elements.get("tasks-feedback")),
   };
@@ -162,6 +189,237 @@ for (const detail of [false, true]) {
     }
   });
 }
+
+test("另一标签退出会清除列表、详情和输出，迟到的任务与输出响应无法恢复画面", async () => {
+  const shared = makeSharedVersionStore();
+  const list = makePage(false, shared);
+  const detail = makePage(true, shared);
+  const delayedDetail = makePage(true, shared);
+  const outputId = "537fa1a6-e9d7-4c46-9f22-ddfbf6a3b0a4";
+  list.reply(0, snapshot(false, "2"));
+  for (const page of [detail, delayedDetail]) {
+    page.reply(0, { ...snapshot(true, "2"), output_id: outputId });
+  }
+  await settle();
+  const shown = detail.readOutput();
+  assert.equal(detail.fetches[1].path, `/api/tasks/${taskId}/outputs/${outputId}`);
+  detail.reply(1, { text: "<b>synthetic-private-log</b>" });
+  await shown;
+  assert.match(detail.rows(), /<b>synthetic-private-log<\/b>/);
+  const lateOutput = delayedDetail.readOutput();
+  const lateList = list.refresh();
+
+  const source = makePage(false, shared);
+  const logout = source.logout();
+  assert.equal(source.fetches[1].path, "/api/session");
+  assert.equal(source.fetches[1].method, "DELETE");
+  shared.cookie = "";
+  source.reply(1, null, 204);
+  await logout;
+  for (const page of [list, detail, delayedDetail]) {
+    assert.equal(page.rows(), "");
+    assert.match(page.feedback(), /会话已失效/);
+  }
+  list.reply(1, snapshot(false, "3"));
+  delayedDetail.reply(1, { text: "synthetic-late-output" });
+  await Promise.all([lateList, lateOutput]);
+  assert.equal(list.rows(), "");
+  assert.equal(delayedDetail.rows(), "");
+  assert.equal(shared.values.get(versionKey), "2");
+  assert.equal(list.fetches.length, 2);
+  assert.equal(delayedDetail.fetches.length, 2);
+});
+
+test("退出响应中断且 Cookie 未变时，服务端会话核对清屏并拒绝迟到内容", async () => {
+  const shared = makeSharedVersionStore();
+  const source = makePage(false, shared);
+  const list = makePage(false, shared);
+  const detail = makePage(true, shared);
+  const pendingDetail = makePage(true, shared);
+  const outputId = "537fa1a6-e9d7-4c46-9f22-ddfbf6a3b0a4";
+  list.reply(0, snapshot(false, "2"));
+  for (const page of [detail, pendingDetail]) {
+    page.reply(0, { ...snapshot(true, "2"), output_id: outputId });
+  }
+  await settle();
+  const output = detail.readOutput();
+  detail.reply(1, { text: "synthetic-visible-output" });
+  await output;
+  assert.match(list.rows(), /合成任务/);
+  assert.match(detail.rows(), /synthetic-visible-output/);
+  const lateList = list.refresh();
+  const lateOutput = pendingDetail.readOutput();
+
+  const logout = source.logout();
+  assert.equal(source.fetches[1].method, "DELETE");
+  source.fetches[1].interrupt();
+  await logout;
+  assert.equal(shared.cookie, "labqueue_view_scope=test-session");
+
+  const checks = [list, detail, pendingDetail].map((page) => {
+    const index = page.fetches.length;
+    const promise = page.checkSession();
+    assert.equal(page.fetches[index]?.path, "/api/session");
+    assert.equal(page.fetches[index].method, "GET");
+    assert.strictEqual(page.checkSession(), promise);
+    assert.equal(page.fetches.length, index + 1);
+    return { promise, deny: () => page.reply(index, {}, 401) };
+  });
+  list.reply(1, snapshot(false, "3", { name: "synthetic-late-task" }));
+  await settle();
+  assert.doesNotMatch(list.rows(), /synthetic-late-task/);
+  for (const { deny } of checks) deny();
+  await Promise.all(checks.map(({ promise }) => promise));
+  for (const page of [list, detail, pendingDetail]) {
+    assert.equal(page.rows(), "");
+    assert.match(page.feedback(), /会话已失效/);
+  }
+
+  pendingDetail.reply(1, { text: "synthetic-late-output" });
+  await Promise.all([lateList, lateOutput]);
+  assert.equal(list.rows(), "");
+  assert.equal(pendingDetail.rows(), "");
+});
+
+test("另一标签登录切换账号后，晚到通知不会清除新页，旧页先清除任务", async () => {
+  const shared = makeSharedVersionStore();
+  const list = makePage(false, shared);
+  list.reply(0, snapshot(false, "2"));
+  await settle();
+
+  let submitLogin;
+  let notice;
+  const button = {};
+  const login = {
+    querySelector: () => button,
+    addEventListener: (_event, handler) => { submitLogin = handler; },
+  };
+  const elements = {
+    login, username: { value: "demo-b" }, password: { value: "synthetic-password" },
+    "login-feedback": {},
+  };
+  runInNewContext(submissionScript, {
+    document: { getElementById: (id) => elements[id] ?? null },
+    window: { location: { reload() {} } }, AbortSignal, crypto: require("node:crypto").webcrypto,
+    localStorage: { setItem(key) { notice = key; } },
+    async fetch(path, { method, body }) {
+      assert.equal(path, "/api/session");
+      assert.equal(method, "POST");
+      assert.equal(JSON.parse(body).username, "demo-b");
+      shared.cookie = "labqueue_view_scope=replacement-session";
+      return { status: 200, ok: true, json: async () => ({}) };
+    },
+  });
+  const late = list.refresh();
+  await submitLogin({ preventDefault() {} });
+  assert.equal(notice, "labqueue.session-change");
+  // 即使通知尚未派发，来自旧会话的响应也会触发清屏。
+  list.reply(1, snapshot(false, "3"));
+  await late;
+  assert.equal(list.rows(), "");
+  assert.match(list.feedback(), /会话已失效/);
+
+  const replacement = makePage(false, shared, "replacement-session");
+  replacement.reply(0, snapshot(false, "3", { name: "新账号任务" }));
+  await settle();
+  shared.signal(null, notice);
+  assert.match(replacement.rows(), /新账号任务/);
+  assert.equal(list.rows(), "");
+});
+
+test("浏览器恢复旧详情时先核对会话，未收到通知也不会显示已撤销的画面", async () => {
+  const shared = makeSharedVersionStore();
+  const detail = makePage(true, shared);
+  detail.reply(0, snapshot(true, "2"));
+  await settle();
+  const late = detail.refresh();
+  detail.fire("pagehide", { persisted: true });
+  assert.equal(detail.hidden(), true);
+  shared.cookie = "";
+  await detail.fire("pageshow", { persisted: true });
+  assert.equal(detail.rows(), "");
+  assert.match(detail.feedback(), /会话已失效/);
+  detail.reply(1, snapshot(true, "3"));
+  await late;
+  assert.equal(detail.rows(), "");
+  assert.equal(detail.fetches.length, 2);
+});
+
+test("可见标签在会话通知丢失时通过定期核对清屏", async () => {
+  const shared = makeSharedVersionStore();
+  const list = makePage(false, shared);
+  list.reply(0, snapshot(false, "2"));
+  await settle();
+  assert.match(list.rows(), /合成任务/);
+  shared.cookie = "labqueue_view_scope=other-session";
+  list.checkSession();
+  assert.equal(list.rows(), "");
+  assert.equal(list.fetches.length, 1);
+});
+
+test("历史恢复时即使 Cookie 仍匹配，也要等服务端确认才可重现私有画面", async () => {
+  const detail = makePage(true);
+  detail.reply(0, snapshot(true, "2"));
+  await settle();
+  const old = detail.refresh();
+  detail.fire("pagehide", { persisted: true });
+  const restored = detail.fire("pageshow", { persisted: true });
+  await settle();
+  detail.reply(1, snapshot(true, "3"));
+  await old;
+  assert.equal(detail.hidden(), true);
+  detail.reply(2, {}, 401);
+  await restored;
+  assert.equal(detail.rows(), "");
+  assert.match(detail.feedback(), /会话已失效/);
+});
+
+test("历史恢复拒绝低版本快照，也拒绝返回前发出的私有输出响应", async () => {
+  const shared = makeSharedVersionStore();
+  const detail = makePage(true, shared);
+  const list = makePage(false, shared);
+  const outputId = "537fa1a6-e9d7-4c46-9f22-ddfbf6a3b0a4";
+  const withOutput = (version) => ({ ...snapshot(true, version), output_id: outputId });
+  detail.reply(0, withOutput("2"));
+  await settle();
+  list.reply(0, snapshot(false, "4"));
+  await settle();
+  const output = detail.readOutput();
+  detail.reply(1, { text: "synthetic-before-history" });
+  await output;
+  assert.match(detail.rows(), /synthetic-before-history/);
+
+  detail.fire("pagehide", { persisted: true });
+  const firstRestore = detail.fire("pageshow", { persisted: true });
+  await settle();
+  detail.reply(2, { snapshot_version: "3" }, 404);
+  await firstRestore;
+  assert.equal(detail.hidden(), true);
+  assert.match(detail.feedback(), /尚未取得当前任务/);
+
+  const recheck = detail.refresh();
+  detail.reply(3, withOutput("4"));
+  await recheck;
+  assert.equal(detail.hidden(), false);
+  assert.doesNotMatch(detail.rows(), /synthetic-before-history/);
+  const lateOutput = detail.readOutput();
+  detail.fire("pagehide", { persisted: true });
+  const secondRestore = detail.fire("pageshow", { persisted: true });
+  await settle();
+  detail.reply(4, { text: "synthetic-late-history-output" });
+  await lateOutput;
+  assert.equal(detail.hidden(), true);
+  assert.doesNotMatch(detail.rows(), /synthetic-late-history-output/);
+  detail.reply(5, withOutput("4"));
+  await secondRestore;
+  assert.equal(detail.hidden(), false);
+  assert.doesNotMatch(detail.rows(), /synthetic-late-history-output/);
+
+  const freshOutput = detail.readOutput();
+  detail.reply(6, { text: "synthetic-current-output" });
+  await freshOutput;
+  assert.match(detail.rows(), /synthetic-current-output/);
+});
 
 test("不可见的原任务名保留有效快照并用任务编号提供列表链接", async () => {
   const shared = makeSharedVersionStore();

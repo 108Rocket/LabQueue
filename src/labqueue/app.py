@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import UUID4, BaseModel, ConfigDict, StringConstraints
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from labqueue.auth import SESSION_COOKIE, SESSION_SECONDS, DemoSessions, Session
+from labqueue.auth import SESSION_COOKIE, SESSION_SECONDS, VIEW_SCOPE_COOKIE, DemoSessions, Session
 from labqueue.storage import default_database
 from labqueue.submissions import (
     CommitUncertain,
@@ -28,6 +28,7 @@ from labqueue.submissions import (
     SubmissionStore,
     TaskDetailSnapshot,
     TaskListSnapshot,
+    TaskOutput,
 )
 
 PACKAGE_DIR = Path(__file__).parent
@@ -175,13 +176,26 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             samesite="strict",
             secure=request.url.scheme == "https",
         )
+        # 该标记只供页面检查是否仍属于当前 Cookie 会话，服务端授权不读取它。
+        response.set_cookie(
+            VIEW_SCOPE_COOKIE,
+            session.snapshot_scope,
+            max_age=SESSION_SECONDS,
+            samesite="strict",
+            secure=request.url.scheme == "https",
+        )
         return {"csrf_token": session.csrf_token}
+
+    @app.get("/api/session", dependencies=[Depends(require_csrf)], status_code=204)
+    def check_session() -> Response:
+        return Response(status_code=204)
 
     @app.delete("/api/session", dependencies=[Depends(require_csrf)], status_code=204)
     def logout(request: Request) -> Response:
         app.state.sessions.logout(request.cookies.get(SESSION_COOKIE))
         response = Response(status_code=204)
         response.delete_cookie(SESSION_COOKIE)
+        response.delete_cookie(VIEW_SCOPE_COOKIE)
         return response
 
     submission_router = APIRouter(route_class=SubmissionRoute)
@@ -223,14 +237,26 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         task_id: str, session: Annotated[Session, Depends(read_session)]
     ) -> TaskDetailSnapshot | JSONResponse:
         try:
-            version, task = store.task_detail(session.account, task_id)
+            version, snapshot = store.task_detail(session.account, task_id)
         except sqlite3.Error:
             raise HTTPException(503, "暂时无法读取任务，请刷新。") from None
-        if task is None:
+        if snapshot is None:
             return JSONResponse(
                 {"detail": "未找到该任务。", "snapshot_version": version}, status_code=404
             )
-        return TaskDetailSnapshot(snapshot_version=version, task=task)
+        return snapshot
+
+    @app.get("/api/tasks/{task_id}/outputs/{output_id}")
+    def task_output(
+        task_id: str, output_id: str, session: Annotated[Session, Depends(read_session)]
+    ) -> TaskOutput:
+        try:
+            output = store.read_task_output(session.account, task_id, output_id)
+        except sqlite3.Error:
+            raise HTTPException(503, "暂时无法读取输出，请重试。") from None
+        if output is None:
+            raise HTTPException(404, "未找到该输出。")
+        return output
 
     return app
 
