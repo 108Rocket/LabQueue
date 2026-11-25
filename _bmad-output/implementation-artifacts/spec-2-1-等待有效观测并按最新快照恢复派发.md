@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-11-25'
 status: 'done'
 baseline_commit: '681eb5c0f34132d021d1bbd28d22be8d8f8b4f38'
+review_baseline_commit: '925520ec0a91294256aba8008f06b408c4c25832'
 route: 'dispatch'
 review_loop_iteration: 0
 context: ['{project-root}/_bmad-output/project-context.md']
@@ -87,3 +88,30 @@ Python 55 项、Node.js 31 项通过。Ruff、本地启动与写 API 范围检�
 - 截止点前保持有效。达到截止点时，时钟、过期状态与代际在同一提交可见。重复读取、重复推进和回拨均未重复推进代际。
 - GPU 1 可用经故障恢复后只剩 GPU 2 可准入。迟到序号、旧发布者以及其他数据库面向同一代际和序号签发的令牌均无法覆盖当前结果。
 - 旧库迁移和重启保留任务与队位。页面版本写入失败触发观测及准入代际回滚。发布者换代提交回执丢失时从新连接核对持久身份。
+
+### 2026-11-25 · 对提交 `925520e` 的双卡模拟复审
+
+基线上已复现两项阻塞。最晚合法采集在第 29 秒推进时被拒绝。普通发布的 SQLite 事务提交后丢失回执，调用方仍收到异常。
+
+- `test_observation_clock_reserves_headroom_for_collection_deadline` 覆盖最晚合法采集。时钟可推进到 SQLite 整数上限，只有能容纳完整 30 秒有效期的时刻才允许开始采集。独立连接在第 29 秒读到 GPU 1 可用，第 30 秒读到候选为空，重复推进后代际和页面版本均未再增加。
+- `test_observation_publish_reconciles_after_lost_commit` 覆盖普通发布。每次尝试与观测同事务保存唯一标记。提交异常时，仍打开的事务可回滚，结果不明则关闭原连接，用新的只读连接核对。当更新的观测已替换证据或读取失败时，抛出 `PublicationCommitUnknown`。核对过程中不会重放观测。
+
+两项定向回归共 8 个用例通过，其中发布故障注入 7 个。Python 全量 63 项、前端 31 项、Ruff 和本地启动检查全部通过。Python 测试环境仍报告一条 Starlette 对 `httpx` 的弃用警告。
+
+### 2026-11-25 · 发布核对遇到旧表或缺失文件
+
+在提交成功但回执丢失后注入两种故障，均得到 `PublicationCommitUnknown`。
+
+- `test_observation_publish_preserves_inaccessible_evidence[missing_column]` 通过。旧表缺少 `publication_attempt_id` 时，核对后表结构保持原样。在应用设置 `query_only` 前，尝试写入已被 SQLite 以 `SQLITE_READONLY` 拒绝。
+- `test_observation_publish_preserves_inaccessible_evidence[missing_file]` 通过。核对以 `mode=ro` 打开原路径，文件消失时得到 `SQLITE_CANTOPEN`，该路径仍不存在。
+
+观测定向测试 35 项通过，包含以上两项及 33 项已有用例。Python 全量 65 项通过，Ruff 检查通过。
+
+### 2026-11-25 · 独立复验结论
+
+双卡模拟独立复验通过，Story 2.1 的两项复审阻塞均已关闭。
+
+- **9 个指定用例全部通过。** 发布提交结果核对覆盖 7 种故障场景。已提交但回执丢失时，新连接能核实结果，准入代际和页面版本只推进一次，较新的观测保持有效。另 2 个用例分别验证旧表缺列和原库文件消失，两者均报告 `PublicationCommitUnknown`，旧表结构得到保留，原数据库路径不会被重建。
+- **4 个相关回归全部通过。** 模拟时钟上限用例在第 29 秒仍读到候选卡，第 30 秒准入关闭。旧库迁移用例通过。发布者轮换的两种提交结果均得到正确核对。
+
+实际任务领取、恢复后新增领取次数及租约绑定的 GPU UUID 留到 Story 2.2 联调。

@@ -97,6 +97,14 @@ class SubmissionStore:
             raise
         return db
 
+    def _connect_readonly(self) -> sqlite3.Connection:
+        return sqlite3.connect(
+            self.path.absolute().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=LOCK_WAIT_SECONDS,
+            autocommit=True,
+        )
+
     def initialize(self) -> SimulatedObservations:
         prepare_storage(self.path)
         with closing(self._connect()) as db:
@@ -146,7 +154,9 @@ class SubmissionStore:
                     UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1;
                 END;
                 """)
-            publisher = SimulatedObservations(self._connect, *initialize_observations(db))
+            publisher = SimulatedObservations(
+                self._connect, self._connect_readonly, *initialize_observations(db)
+            )
             publisher.commit_rotation(db)
         return publisher
 

@@ -18,9 +18,9 @@ import labqueue.submissions as submissions
 from labqueue.app import create_app, require_csrf
 from labqueue.auth import VIEW_SCOPE_COOKIE, Session
 from labqueue.observations import (
-    MAX_CLOCK_SECONDS,
     OBSERVATION_TTL_SECONDS,
     SIMULATED_GPU_UUIDS,
+    PublicationCommitUnknown,
     StalePublisher,
     read_admission,
 )
@@ -534,17 +534,40 @@ def test_observation_rejects_foreign_tokens_and_modified_collection_times(
 def test_observation_clock_reserves_headroom_for_collection_deadline(client, database, queued_task):
     headers, receipt = queued_task
     publisher = client.app.state.observations
-    publisher.advance_clock(MAX_CLOCK_SECONDS)
+    max_clock = 2**63 - 1
+    latest_start = max_clock - OBSERVATION_TTL_SECONDS
+    publisher.advance_clock(latest_start)
     token = publisher.begin_collection()
-    assert token.deadline == 2**63 - 1
+    assert token.started_at == latest_start
+    assert token.deadline == max_clock
     assert publisher.publish(token, {GPU_1: "idle", GPU_2: "busy"})
-    current = assert_owner_admission(
+    available, version = assert_owner_admission(
         client, database, headers, receipt, "waiting_dispatch", (GPU_1,)
     )
-    with pytest.raises(ValueError, match="为采集截止点保留"):
-        publisher.advance_clock(MAX_CLOCK_SECONDS + 1)
-    assert committed_admission(database) == current
-    assert publisher.begin_collection().deadline == token.deadline
+
+    publisher.advance_clock(latest_start + 29)
+    almost, almost_version = assert_owner_admission(
+        client, database, headers, receipt, "waiting_dispatch", (GPU_1,)
+    )
+    assert almost.clock == token.deadline - 1
+    assert almost.admission_generation == available.admission_generation
+    assert almost_version == version
+    with pytest.raises(ValueError, match="无法记录下一次采集的截止点"):
+        publisher.begin_collection()
+    assert committed_admission(database) == (almost, almost_version)
+
+    publisher.advance_clock(latest_start + 30)
+    expired, expired_version = assert_owner_admission(
+        client, database, headers, receipt, "gpu_observation_expired"
+    )
+    assert expired.clock == token.deadline
+    assert expired.admission_generation == available.admission_generation + 1
+    assert expired_version == version + 1
+    publisher.advance_clock(token.deadline)
+    publisher.advance_clock(token.deadline - 1)
+    with pytest.raises(ValueError, match="SQLite 整数范围"):
+        publisher.advance_clock(token.deadline + 1)
+    assert committed_admission(database) == (expired, expired_version)
 
 
 def test_observation_changes_candidates_without_changing_waiting_reason(
@@ -656,6 +679,180 @@ def test_observation_publication_retries_busy_writer(
     assert blocked.published_sequence == failure.sequence
     assert blocked.admission_generation == tokens_before.admission_generation + 1
     assert current_version == version + 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "committed", "closed_after_commit", "rolled_back", "open_transaction",
+        "superseded", "same_token", "read_failure",
+    ],
+)
+def test_observation_publish_reconciles_after_lost_commit(
+    client, database, queued_task, monkeypatch, fault
+):
+    headers, receipt = queued_task
+    publisher = client.app.state.observations
+    publish(client, {GPU_1: "idle", GPU_2: "busy"})
+    pending = publisher.begin_collection()
+    newer = publisher.begin_collection()
+    before, version = committed_admission(database)
+    original_connect = sqlite3.connect
+    connections = []
+    evidence_reads = []
+
+    class LostCommit(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == "COMMIT":
+                if fault in ("rolled_back", "same_token"):
+                    super().execute("ROLLBACK")
+                elif fault != "open_transaction":
+                    super().execute("COMMIT")
+                if fault in ("superseded", "same_token"):
+                    competing = newer if fault == "superseded" else pending
+                    with monkeypatch.context() as patch:
+                        patch.setattr(sqlite3, "connect", original_connect)
+                        assert publisher.publish(competing, {GPU_1: "unknown", GPU_2: "idle"})
+                if fault == "closed_after_commit":
+                    self.close()
+                raise sqlite3.OperationalError("synthetic lost publication result")
+            if "FROM gpu_admission_state WHERE" in sql and len(connections) > 1:
+                evidence_reads.append(self)
+                assert super().execute("PRAGMA query_only").fetchone()[0] == 1
+                if fault == "read_failure":
+                    raise sqlite3.OperationalError("synthetic unreadable publication evidence")
+            return super().execute(sql, parameters)
+
+    def connect(*args, **kwargs):
+        if connections:
+            with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+                connections[0].execute("SELECT 1")
+        db = original_connect(*args, **kwargs, factory=LostCommit)
+        connections.append(db)
+        return db
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", connect)
+        if fault in ("superseded", "read_failure"):
+            with pytest.raises(PublicationCommitUnknown) as unknown:
+                publisher.publish(pending, None)
+            if fault == "read_failure":
+                assert str(unknown.value.__cause__) == "synthetic unreadable publication evidence"
+        elif fault == "same_token":
+            assert publisher.publish(pending, None) is False
+        else:
+            expected_commit = fault in ("committed", "closed_after_commit")
+            assert publisher.publish(pending, None) is expected_commit
+
+    if fault == "open_transaction":
+        assert len(connections) == 1 and not evidence_reads
+    else:
+        assert len(connections) == 2
+        assert evidence_reads == [connections[1]]
+
+    if fault in ("rolled_back", "open_transaction"):
+        assert assert_owner_admission(
+            client, database, headers, receipt, "waiting_dispatch", (GPU_1,)
+        ) == (before, version)
+        return
+
+    if fault in ("superseded", "same_token"):
+        after, after_version = assert_owner_admission(
+            client, database, headers, receipt, "gpu_visibility_unknown"
+        )
+        assert after.published_sequence == (newer if fault == "superseded" else pending).sequence
+        assert after.admission_generation == before.admission_generation + 1
+        assert after_version == version + (2 if fault == "superseded" else 1)
+        return
+
+    after, after_version = assert_owner_admission(
+        client, database, headers, receipt, "gpu_monitoring_failed"
+    )
+    assert after.published_sequence == pending.sequence
+    assert after.admission_generation == before.admission_generation + 1
+    assert after_version == version + 1
+
+
+@pytest.mark.parametrize("loss", ["missing_column", "missing_file"])
+def test_observation_publish_preserves_inaccessible_evidence(tmp_path, monkeypatch, loss):
+    path = tmp_path / "private" / "admission #&% evidence.sqlite3"
+    publisher = SubmissionStore(path).initialize().replace_publisher()
+    pending = publisher.begin_collection()
+    original_connect = sqlite3.connect
+    legacy_schema = None
+
+    class LostCommit(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal legacy_schema
+            if sql != "COMMIT":
+                return super().execute(sql, parameters)
+            super().execute("COMMIT")
+            self.close()
+            if loss == "missing_file":
+                path.unlink()
+            else:
+                with closing(original_connect(path, autocommit=True)) as legacy:
+                    legacy.execute(
+                        "ALTER TABLE gpu_admission_state DROP COLUMN publication_attempt_id"
+                    )
+                    legacy_schema = legacy.execute(
+                        "SELECT name, sql FROM sqlite_schema ORDER BY name"
+                    ).fetchall()
+            raise sqlite3.OperationalError("synthetic lost publication result")
+
+    def connect(*args, **kwargs):
+        db = original_connect(*args, **kwargs, factory=LostCommit)
+        if legacy_schema is not None:
+            # 在应用设置 query_only 之前，文件打开模式本身就必须拒绝写入。
+            with pytest.raises(sqlite3.OperationalError) as denied:
+                db.execute("PRAGMA user_version = 1")
+            assert denied.value.sqlite_errorcode & 0xFF == sqlite3.SQLITE_READONLY
+        return db
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", connect)
+        with pytest.raises(PublicationCommitUnknown) as unknown:
+            publisher.publish(pending, {GPU_1: "idle", GPU_2: "busy"})
+
+    cause = unknown.value.__cause__
+    assert isinstance(cause, sqlite3.OperationalError)
+    if loss == "missing_file":
+        assert cause.sqlite_errorcode & 0xFF == sqlite3.SQLITE_CANTOPEN
+        assert not path.exists()
+    else:
+        assert "no such column: publication_attempt_id" in str(cause)
+        assert legacy_schema is not None
+        with closing(original_connect(path, autocommit=True)) as legacy:
+            assert legacy.execute(
+                "SELECT name, sql FROM sqlite_schema ORDER BY name"
+            ).fetchall() == legacy_schema
+            assert "publication_attempt_id" not in {
+                column[1] for column in legacy.execute("PRAGMA table_info(gpu_admission_state)")
+            }
+
+
+def test_observation_restart_migrates_admission_without_publication_attempt_column(
+    client, database, queued_task
+):
+    headers, receipt = queued_task
+    publish(client, {GPU_1: "idle", GPU_2: "busy"})
+    before, version = committed_admission(database)
+    with closing(sqlite3.connect(database, autocommit=True)) as db:
+        db.execute("ALTER TABLE gpu_admission_state DROP COLUMN publication_attempt_id")
+
+    replacement = SubmissionStore(database).initialize()
+    after, after_version = assert_owner_admission(
+        client, database, headers, receipt, "gpu_monitoring_failed"
+    )
+    assert after.admission_generation == before.admission_generation + 1
+    assert after_version == version + 1
+    token = replacement.begin_collection()
+    assert replacement.publish(token, {GPU_1: "busy", GPU_2: "idle"})
+    restored, restored_version = assert_owner_admission(
+        client, database, headers, receipt, "waiting_dispatch", (GPU_2,)
+    )
+    assert restored.publication_attempt_id is not None
+    assert restored_version == after_version + 1
 
 
 @pytest.mark.parametrize("rotation_landed", [True, False])
