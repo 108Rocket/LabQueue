@@ -104,7 +104,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             and Path("data/labqueue.sqlite3").exists()
         ):
             raise RuntimeError("检测到旧任务库，请先停服并将 SQLite 备份迁入账号私有目录")
-        store.initialize()
+        app.state.observations = store.initialize()
         app.state.sessions = DemoSessions()
         yield
 

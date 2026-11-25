@@ -18,7 +18,7 @@ $env:LABQUEUE_DEMO_B_PASSWORD = Read-Host '为 demo-b 设置本地模拟密码'
 
 登录后可用任务名和合成命令（例如 `echo synthetic-job`）提交，显存选择「未知」即可。任务保存在运行账号的私有目录，Windows 使用 `%LOCALAPPDATA%\LabQueue\labqueue.sqlite3`，Linux 使用 `~/.local/share/labqueue/labqueue.sqlite3`。服务重启后重新登录，可用原提交键核对回执。
 
-依次用 `demo-a` 和 `demo-b` 提交任务，再分别进入「我的任务」及其任务详情。两个账号各自只会看到本人任务。全局队位按确认入队的顺序跨组计算，库中原有的排队任务也计入队位。模拟输入初始设为两张卡均被占用。页面「刷新」只读取任务；晚到的旧版本不会覆盖较新的队位和原因。页面标为「上次确认」时，可刷新以获取当前快照。此页面使用浏览器的 Web Locks 和本地存储，在同一登录会话的多个窗口间核对版本。
+依次用 `demo-a` 和 `demo-b` 提交任务，再分别进入「我的任务」及其任务详情。两个账号各自只会看到本人任务。全局队位按确认入队的顺序跨组计算，库中原有的排队任务也计入队位。常规启动后尚无有效模拟观测，页面显示「模拟 GPU 监测失败，暂停派发」。页面「刷新」只读取任务；晚到的旧版本不会覆盖较新的队位和原因。页面标为「上次确认」时，可刷新以获取当前快照。此页面使用浏览器的 Web Locks 和本地存储，在同一登录会话的多个窗口间核对版本。
 
 详情有私有输出时，提交者可点击「读取私有输出」。独立验收用测试夹具写入合成输出。设置 `LABQUEUE_DEMO_A_PEER_PASSWORD` 可启用同组测试账号 `demo-a-peer`。在另一标签页退出或换号后，旧标签页会清除已显示的任务和输出。
 
@@ -62,7 +62,14 @@ $env:LABQUEUE_DEMO_B_PASSWORD = Read-Host '为 demo-b 设置本地模拟密码'
 node --test tests/submission_page.test.cjs tests/tasks_page.test.cjs
 ```
 
-测试使用独立临时 SQLite 库和合成账号。Story 1.1 覆盖提交、权限校验、回执核对及幂等重放。Story 1.2 覆盖跨组队位、重启、只读权限和 WAL 快照一致性。Node 测试覆盖提交反馈，以及列表和详情在乱序响应、切页和重开时的版本保护。
+测试使用独立临时 SQLite 库和合成账号。Story 1.1 覆盖提交、权限校验、回执核对及幂等重放。Story 1.2 覆盖跨组队位、重启、只读权限和 WAL 快照一致性。Story 2.1 覆盖观测失败、漏报、占用不明、精确到期、基于最新快照恢复候选和旧库迁移。Node 测试覆盖提交反馈，以及列表和详情在乱序响应、切页和重开时的版本保护。
+
+可单独验证本地模拟观测和任务页。
+
+```powershell
+.\.tools\python\bin\uv.exe run --locked pytest -q tests/test_submissions.py -k "observation or old_queue or task_snapshot_reads"
+node --test tests/tasks_page.test.cjs
+```
 
 ## 团队与 AI 使用声明
 

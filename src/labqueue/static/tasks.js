@@ -8,7 +8,10 @@ const taskResults = byId("task-results");
 const refreshButton = byId("refresh-tasks");
 const waitingReasons = {
   gpu_busy: "两张模拟 GPU 均被占用。",
+  gpu_monitoring_failed: "模拟 GPU 监测失败，暂停派发。",
+  gpu_observation_expired: "模拟 GPU 观测已过期，暂停派发。",
   gpu_visibility_unknown: "模拟 GPU 占用状态待确认。",
+  waiting_dispatch: "等待调度。",
 };
 const decimalVersion = /^(?:0|[1-9][0-9]*)$/;
 const taskUuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
