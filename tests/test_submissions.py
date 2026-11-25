@@ -855,9 +855,17 @@ def test_observation_restart_migrates_admission_without_publication_attempt_colu
     assert restored_version == after_version + 1
 
 
-@pytest.mark.parametrize("rotation_landed", [True, False])
+@pytest.mark.parametrize(
+    ("entry_point", "fault"),
+    [
+        ("replace", "lost_result"),
+        ("replace", "closed_after_commit"),
+        ("replace", "competing_rotation"),
+        ("initialize", "closed_after_commit"),
+    ],
+)
 def test_observation_publisher_reconciles_only_exact_rotation(
-    client, database, queued_task, monkeypatch, rotation_landed
+    client, database, queued_task, monkeypatch, entry_point, fault
 ):
     headers, receipt = queued_task
     publisher = client.app.state.observations
@@ -866,34 +874,45 @@ def test_observation_publisher_reconciles_only_exact_rotation(
     original_connect = sqlite3.connect
     connections = []
     competing_publishers = []
+    rotate = (
+        SubmissionStore(database).initialize
+        if entry_point == "initialize"
+        else publisher.replace_publisher
+    )
 
     class LoseCommitResult(sqlite3.Connection):
         def execute(self, sql, parameters=()):
             if sql != "COMMIT":
                 return super().execute(sql, parameters)
-            super().execute("COMMIT" if rotation_landed else "ROLLBACK")
-            if not rotation_landed:
+            if fault == "competing_rotation":
+                super().execute("ROLLBACK")
                 with monkeypatch.context() as patch:
                     patch.setattr(sqlite3, "connect", original_connect)
                     competing_publishers.append(SubmissionStore(database).initialize())
+            else:
+                super().execute("COMMIT")
+                if fault == "closed_after_commit":
+                    self.close()
             raise sqlite3.OperationalError("synthetic lost rotation result")
 
     def connect(*args, **kwargs):
         if connections:
             with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
                 connections[0].execute("SELECT 1")
+            assert kwargs.get("uri") is True
+            assert args[0].endswith("?mode=ro")
         db = original_connect(*args, **kwargs, factory=LoseCommitResult)
         connections.append(db)
         return db
 
     with monkeypatch.context() as patch:
         patch.setattr(sqlite3, "connect", connect)
-        if rotation_landed:
-            replacement = publisher.replace_publisher()
-        else:
+        if fault == "competing_rotation":
             with pytest.raises(sqlite3.OperationalError, match="synthetic lost rotation result"):
-                publisher.replace_publisher()
+                rotate()
             replacement, = competing_publishers
+        else:
+            replacement = rotate()
 
     assert len(connections) == 2
     closed, closed_version = assert_owner_admission(
@@ -903,6 +922,8 @@ def test_observation_publisher_reconciles_only_exact_rotation(
     assert closed.publisher_id != available.publisher_id
     assert closed.admission_generation == available.admission_generation + 1
     assert closed_version == version + 1
+    with pytest.raises(StalePublisher):
+        publisher.begin_collection()
     token = replacement.begin_collection()
     assert replacement.publish(token, {GPU_1: "busy", GPU_2: "idle"})
     assert_owner_admission(client, database, headers, receipt, "waiting_dispatch", (GPU_2,))

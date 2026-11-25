@@ -247,16 +247,23 @@ class SimulatedObservations:
             (commit or self._commit)(db)
 
     @staticmethod
+    def _rollback_open_transaction(db: sqlite3.Connection) -> bool:
+        try:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+                return True
+        except sqlite3.Error:
+            # 原连接可能已关闭，须由调用方从持久状态核对提交结果。
+            pass
+        return False
+
     def _commit(
-        db: sqlite3.Connection, reconcile: Callable[[], bool] | None = None
+        self, db: sqlite3.Connection, reconcile: Callable[[], bool] | None = None
     ) -> None:
         try:
             db.execute("COMMIT")
         except sqlite3.Error:
-            if db.in_transaction:
-                db.execute("ROLLBACK")
-                raise
-            if reconcile is None:
+            if self._rollback_open_transaction(db) or reconcile is None:
                 raise
             db.close()
             if not reconcile():
@@ -281,13 +288,8 @@ class SimulatedObservations:
         try:
             db.execute("COMMIT")
         except sqlite3.Error as error:
-            try:
-                if db.in_transaction:
-                    db.execute("ROLLBACK")
-                    return False
-            except sqlite3.Error:
-                # 连接丢失时也可能无法读取事务状态，改查持久证据。
-                pass
+            if self._rollback_open_transaction(db):
+                return False
             db.close()
             try:
                 state = self._read_committed()
