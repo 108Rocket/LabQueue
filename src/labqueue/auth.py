@@ -21,6 +21,7 @@ class Session:
     account: Account
     csrf_token: str
     expires_at: float
+    snapshot_scope: str
 
 
 class DemoSessions:
@@ -44,7 +45,9 @@ class DemoSessions:
 
         session_id = secrets.token_urlsafe(32)
         now = monotonic()
-        session = Session(account, secrets.token_urlsafe(32), now + SESSION_SECONDS)
+        session = Session(
+            account, secrets.token_urlsafe(32), now + SESSION_SECONDS, secrets.token_urlsafe(16)
+        )
         with self._lock:
             self._sessions = {
                 key: session for key, session in self._sessions.items() if session.expires_at > now

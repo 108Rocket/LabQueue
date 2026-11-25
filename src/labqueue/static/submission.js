@@ -10,7 +10,9 @@ async function request(path, { method = "GET", body, headers = {} } = {}) {
   if (response.status === 204) return null;
   const data = await response.json();
   if (!response.ok) {
-    throw Object.assign(new Error(data.detail), { status: response.status, fields: data.fields });
+    throw Object.assign(new Error(data?.detail), {
+      status: response.status, fields: data?.fields, snapshotVersion: data?.snapshot_version,
+    });
   }
   return data;
 }
@@ -37,8 +39,8 @@ if (loginForm) {
 }
 
 const session = byId("session");
-if (session) {
-  const headers = { "X-CSRF-Token": session.dataset.csrf };
+const sessionHeaders = session ? { "X-CSRF-Token": session.dataset.csrf } : {};
+if (session && byId("submission")) {
   const form = byId("submission");
   const fields = byId("submission-fields");
   const feedback = byId("submission-feedback");
@@ -130,7 +132,9 @@ if (session) {
     unresolvedKeys.add(attempt.submission_key);
     updatePendingKeys();
     try {
-      showReceipt(await request("/api/submissions", { method: "POST", body: attempt, headers }), feedback);
+      showReceipt(await request("/api/submissions", {
+        method: "POST", body: attempt, headers: sessionHeaders,
+      }), feedback);
       if (lookupKey.value.trim().toLowerCase() === attempt.submission_key) {
         clearLookupFeedback();
       }
@@ -195,7 +199,9 @@ if (session) {
     button.disabled = true;
     lookupFeedback.textContent = "正在核对。";
     try {
-      const receipt = await request(`/api/submissions/${encodeURIComponent(key)}`, { headers });
+      const receipt = await request(`/api/submissions/${encodeURIComponent(key)}`, {
+        headers: sessionHeaders,
+      });
       confirmKey(key);
       if (version === lookupVersion) showReceipt(receipt, lookupFeedback);
       if (pending?.submission_key === key) {
@@ -215,10 +221,12 @@ if (session) {
       button.disabled = false;
     }
   });
+}
 
+if (session) {
   byId("logout").addEventListener("click", async () => {
     try {
-      await request("/api/session", { method: "DELETE", headers });
+      await request("/api/session", { method: "DELETE", headers: sessionHeaders });
       window.location.reload();
     } catch (error) {
       if (error.status === 401 || error.status === 403) {

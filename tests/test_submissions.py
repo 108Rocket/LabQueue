@@ -4,13 +4,14 @@ import sqlite3
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
+import labqueue.submissions as submissions
 from labqueue.app import create_app
 from labqueue.storage import default_database, verify_storage
 from labqueue.submissions import SubmissionStore
@@ -353,3 +354,243 @@ def test_submission_page_requires_login_and_uses_the_authenticated_session(clien
     assert 'data-owner="demo-a"' in page.text and 'id="submission"' in page.text
     assert 'id="lookup"' in page.text and headers["X-CSRF-Token"] in page.text
     assert client.get("/static/submission.js").status_code == 200
+
+
+def api_submit(client, headers, **changes):
+    response = client.post("/api/submissions", json=payload(**changes), headers=headers)
+    assert response.status_code == 200
+    return response.json()
+
+
+@pytest.mark.parametrize("clock_offset", [0, -30])
+def test_cross_group_positions_follow_commit_order_after_reverse_receipts_and_restart(
+    database, monkeypatch, clock_offset
+):
+    first_time = datetime(2026, 11, 25, tzinfo=UTC)
+    times = iter([first_time, first_time + timedelta(seconds=clock_offset)])
+
+    class SequenceClock:
+        @staticmethod
+        def now(tz):
+            assert tz is UTC
+            return next(times)
+
+    first_committed = Barrier(2, timeout=10)
+    release_first_receipt = Barrier(2, timeout=10)
+    original_write = SubmissionStore._write
+
+    def hold_first_receipt(store, account, submission):
+        receipt = original_write(store, account, submission)
+        if account.owner_id == "demo-a":
+            first_committed.wait()
+            release_first_receipt.wait()
+        return receipt
+
+    with (
+        TestClient(create_app(database), base_url=BASE_URL) as first_client,
+        TestClient(create_app(database), base_url=BASE_URL) as second_client,
+    ):
+        first_headers = login(first_client)
+        second_headers = login(second_client, "demo-b")
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as pool:
+            patch.setattr(submissions, "datetime", SequenceClock)
+            patch.setattr(SubmissionStore, "_write", hold_first_receipt)
+            first_pending = pool.submit(api_submit, first_client, first_headers, name="一组任务")
+            first_committed.wait()
+            try:
+                second = api_submit(second_client, second_headers, name="二组任务")
+                assert not first_pending.done()
+            finally:
+                release_first_receipt.wait()
+            first = first_pending.result(timeout=10)
+
+        assert datetime.fromisoformat(first["queued_at"]) == first_time
+        assert datetime.fromisoformat(second["queued_at"]) == first_time + timedelta(
+            seconds=clock_offset
+        )
+        assert (first["enqueue_seq"], second["enqueue_seq"]) == (1, 2)
+        originals = []
+        before = state(database)
+        for actor, headers, receipt, position in (
+            (first_client, first_headers, first, 1),
+            (second_client, second_headers, second, 2),
+        ):
+            response = actor.get("/api/tasks", headers=headers)
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
+            snapshot = response.json()
+            assert snapshot["snapshot_version"] == "2"
+            task, = snapshot["tasks"]
+            assert (task["task_id"], task["enqueue_seq"]) == (receipt["task_id"], str(position))
+            assert (task["queue_position"], task["waiting_reason"], task["can_cancel"]) == (
+                position, "gpu_busy", False
+            )
+            detail = actor.get(f"/api/tasks/{receipt['task_id']}", headers=headers).json()
+            assert detail == {"snapshot_version": "2", "task": task}
+            originals.append(task)
+        assert state(database) == before
+
+    with TestClient(create_app(database), base_url=BASE_URL) as restarted:
+        headers = login(restarted)
+        assert restarted.get("/api/tasks", headers=headers).json() == {
+            "snapshot_version": "2", "tasks": [originals[0]],
+        }
+        headers = login(restarted, "demo-b")
+        assert restarted.get("/api/tasks", headers=headers).json() == {
+            "snapshot_version": "2", "tasks": [originals[1]],
+        }
+        third = api_submit(restarted, headers, name="重启后入队")
+        assert third["enqueue_seq"] == 3
+        snapshot = restarted.get("/api/tasks", headers=headers).json()
+        assert snapshot["snapshot_version"] == "3"
+        original, latest = snapshot["tasks"]
+        assert original == originals[1]
+        assert (latest["task_id"], latest["queue_position"], latest["waiting_reason"]) == (
+            third["task_id"], 3, "gpu_busy"
+        )
+
+
+def test_task_pages_and_api_are_owner_scoped(client):
+    headers = login(client)
+    name = "private-task-name-marker"
+    receipt = api_submit(client, headers, name=name)
+    path = f"/api/tasks/{receipt['task_id']}"
+    html_path = f"/tasks/{receipt['task_id']}"
+    assert 'href="/tasks">我的任务' in client.get("/").text
+    assert 'id="tasks-page"' in client.get("/tasks").text
+    detail_page = client.get(html_path).text
+    assert 'id="tasks-page"' in detail_page
+    assert f'data-task-id="{receipt["task_id"]}"' in detail_page
+    assert '<script src="/static/tasks.js" defer></script>' in detail_page
+    assert 'id="submission"' not in client.get("/tasks").text
+    assert name not in detail_page
+    assert client.get("/static/tasks.js").status_code == 200
+    assert client.get(path, headers=headers).json()["task"]["name"] == name
+    assert client.delete("/api/session", headers=headers).status_code == 204
+
+    assert 'id="login"' in client.get(html_path).text
+    assert 'id="tasks-page"' not in client.get(html_path).text
+    for api_path in ("/api/tasks", path):
+        denied = client.get(api_path)
+        assert denied.status_code == 401 and set(denied.json()) == {"detail"}
+    second_headers = login(client, "demo-b")
+    listing = client.get("/api/tasks", headers=second_headers)
+    assert listing.json() == {"snapshot_version": "1", "tasks": []}
+    foreign = client.get(path, headers=second_headers)
+    missing = client.get(f"/api/tasks/{uuid4()}", headers=second_headers)
+    assert foreign.status_code == missing.status_code == 404
+    assert foreign.json() == missing.json() == {"detail": "未找到该任务。", "snapshot_version": "1"}
+    for api_path in ("/api/tasks", path):
+        old_page = client.get(api_path, headers=headers)
+        assert old_page.status_code == 403 and set(old_page.json()) == {"detail"}
+
+
+@pytest.mark.parametrize("view", ["list", "detail", "foreign"])
+@pytest.mark.parametrize("leave_queue", [False, True])
+def test_task_snapshot_reads_version_position_and_reason_in_one_wal_snapshot(
+    client, database, monkeypatch, view, leave_queue
+):
+    first = api_submit(client, login(client))
+    headers = login(client, "demo-b")
+    second = api_submit(client, headers)
+    second_path = f"/api/tasks/{second['task_id']}"
+    first_path = f"/api/tasks/{first['task_id']}"
+    path = {"list": "/api/tasks", "detail": second_path, "foreign": first_path}[view]
+    original_task = client.get(second_path, headers=headers).json()["task"]
+    assert (original_task["queue_position"], original_task["waiting_reason"]) == (2, "gpu_busy")
+    started_read = Barrier(2, timeout=10)
+    continue_read = Barrier(2, timeout=10)
+    original_connect = sqlite3.connect
+
+    class StagedRead(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if "FROM simulated_gpu_observations WHERE" in sql:
+                assert self.in_transaction
+                started_read.wait()
+                continue_read.wait()
+            return super().execute(sql, parameters)
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, **kwargs, factory=StagedRead)
+
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as pool:
+        patch.setattr(sqlite3, "connect", connect)
+        old_pending = pool.submit(client.get, path, headers=headers)
+        started_read.wait()
+        try:
+            with closing(original_connect(database, autocommit=True)) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                if leave_queue:
+                    writer.execute(
+                        "UPDATE tasks SET status = 'completed' WHERE task_id = ?",
+                        (first["task_id"],),
+                    )
+                writer.execute("UPDATE simulated_gpu_observations SET occupancy = 'unknown'")
+                writer.execute("UPDATE queue_state SET snapshot_version = snapshot_version + 1")
+                writer.execute("COMMIT")
+        finally:
+            continue_read.wait()
+        old = old_pending.result(timeout=10)
+
+    if view == "foreign":
+        assert old.status_code == 404
+        assert old.json() == {"detail": "未找到该任务。", "snapshot_version": "2"}
+        current_absence = client.get(path, headers=headers)
+        assert current_absence.status_code == 404
+        assert current_absence.json() == {"detail": "未找到该任务。", "snapshot_version": "3"}
+    else:
+        assert old.status_code == 200
+        assert old.json()["snapshot_version"] == "2"
+        old_task = old.json()["task"] if view == "detail" else old.json()["tasks"][0]
+        assert old_task == original_task
+    before = state(database)
+    new_list = client.get("/api/tasks", headers=headers).json()
+    new_detail = client.get(second_path, headers=headers).json()
+    new_task, = new_list["tasks"]
+    assert new_detail == {"snapshot_version": "3", "task": new_task}
+    assert new_list["snapshot_version"] == "3"
+    assert new_task == {
+        **original_task, "queue_position": 1 if leave_queue else 2,
+        "waiting_reason": "gpu_visibility_unknown",
+    }
+    if leave_queue:
+        first_headers = login(client)
+        own_list = client.get("/api/tasks", headers=first_headers).json()
+        left, = own_list["tasks"]
+        assert (left["status"], left["queue_position"], left["waiting_reason"]) == (
+            "completed", None, None
+        )
+        assert client.get(first_path, headers=first_headers).json() == {
+            "snapshot_version": "3", "task": left,
+        }
+    assert state(database) == before
+
+
+def test_task_read_model_migrates_story_1_1_db_and_preserves_simulation_on_restart(database):
+    with TestClient(create_app(database), base_url=BASE_URL) as previous:
+        body = payload()
+        receipt = previous.post("/api/submissions", json=body, headers=login(previous)).json()
+    with closing(sqlite3.connect(database, autocommit=True)) as db:
+        db.executescript("DROP TABLE simulated_gpu_observations; DROP INDEX queued_by_sequence;")
+        db.execute("UPDATE queue_state SET snapshot_version = 9007199254740993")
+
+    with TestClient(create_app(database), base_url=BASE_URL) as migrated:
+        headers = login(migrated)
+        prior = migrated.get(f"/api/submissions/{body['submission_key']}", headers=headers)
+        assert prior.json() == receipt
+        snapshot = migrated.get("/api/tasks", headers=headers).json()
+        assert snapshot["snapshot_version"] == "9007199254740993"
+        assert snapshot["tasks"][0]["waiting_reason"] == "gpu_busy"
+
+    with closing(sqlite3.connect(database, autocommit=True)) as db:
+        db.executescript("""
+            BEGIN IMMEDIATE;
+            DELETE FROM simulated_gpu_observations WHERE slot = 0;
+            UPDATE queue_state SET snapshot_version = snapshot_version + 1;
+            COMMIT;
+            """)
+    with TestClient(create_app(database), base_url=BASE_URL) as restarted:
+        headers = login(restarted)
+        snapshot = restarted.get("/api/tasks", headers=headers).json()
+        assert snapshot["snapshot_version"] == "9007199254740994"
+        assert snapshot["tasks"][0]["waiting_reason"] == "gpu_visibility_unknown"

@@ -26,6 +26,8 @@ from labqueue.submissions import (
     Submission,
     SubmissionConflict,
     SubmissionStore,
+    TaskDetailSnapshot,
+    TaskListSnapshot,
 )
 
 PACKAGE_DIR = Path(__file__).parent
@@ -82,6 +84,14 @@ def verify_page_session(request: Request, session: Session) -> None:
         raise HTTPException(403, "会话凭证已变更，请刷新页面。")
 
 
+def read_session(
+    request: Request, session: Annotated[Session, Depends(require_session)]
+) -> Session:
+    if "X-CSRF-Token" in request.headers:
+        verify_page_session(request, session)
+    return session
+
+
 def create_app(database_path: Path | None = None) -> FastAPI:
     store = SubmissionStore(database_path or default_database())
 
@@ -116,12 +126,27 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                 fields[field] = FIELD_ERRORS[field]
         return JSONResponse({"detail": "请检查请求内容。", "fields": fields}, status_code=422)
 
-    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-    def home(request: Request) -> HTMLResponse:
+    def page(
+        request: Request, *, task_view: bool = False, task_id: str | None = None
+    ) -> HTMLResponse:
         session = app.state.sessions.get(request.cookies.get(SESSION_COOKIE))
         return templates.TemplateResponse(
-            request=request, name="index.html", context={"session": session}
+            request=request,
+            name="index.html",
+            context={"session": session, "task_view": task_view, "task_id": task_id},
         )
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    def home(request: Request) -> HTMLResponse:
+        return page(request)
+
+    @app.get("/tasks", response_class=HTMLResponse, include_in_schema=False)
+    def tasks_page(request: Request) -> HTMLResponse:
+        return page(request, task_view=True)
+
+    @app.get("/tasks/{task_id}", response_class=HTMLResponse, include_in_schema=False)
+    def task_page(request: Request, task_id: str) -> HTMLResponse:
+        return page(request, task_view=True, task_id=task_id)
 
     @app.get("/health")
     def health() -> dict[str, str | bool]:
@@ -176,12 +201,8 @@ def create_app(database_path: Path | None = None) -> FastAPI:
 
     @app.get("/api/submissions/{submission_key}")
     def lookup(
-        submission_key: UUID4,
-        request: Request,
-        session: Annotated[Session, Depends(require_session)],
+        submission_key: UUID4, session: Annotated[Session, Depends(read_session)]
     ) -> Receipt:
-        if "X-CSRF-Token" in request.headers:
-            verify_page_session(request, session)
         try:
             receipt = store.lookup(session.account, submission_key)
         except sqlite3.Error:
@@ -189,6 +210,27 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         if receipt is None:
             raise HTTPException(404, "当前未核对到该提交的回执。")
         return receipt
+
+    @app.get("/api/tasks")
+    def list_tasks(session: Annotated[Session, Depends(read_session)]) -> TaskListSnapshot:
+        try:
+            return store.list_tasks(session.account)
+        except sqlite3.Error:
+            raise HTTPException(503, "暂时无法读取任务，请刷新。") from None
+
+    @app.get("/api/tasks/{task_id}", response_model=TaskDetailSnapshot)
+    def task_detail(
+        task_id: str, session: Annotated[Session, Depends(read_session)]
+    ) -> TaskDetailSnapshot | JSONResponse:
+        try:
+            version, task = store.task_detail(session.account, task_id)
+        except sqlite3.Error:
+            raise HTTPException(503, "暂时无法读取任务，请刷新。") from None
+        if task is None:
+            return JSONResponse(
+                {"detail": "未找到该任务。", "snapshot_version": version}, status_code=404
+            )
+        return TaskDetailSnapshot(snapshot_version=version, task=task)
 
     return app
 

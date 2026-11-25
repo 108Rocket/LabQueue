@@ -2,7 +2,7 @@
 
 面向研究生的共用 GPU 排队项目：一台服务器、两张 L20、多个研究组，普通用户权限部署。
 
-当前可在本地用合成账号提交任务和核对入队回执。显存可以未知，任务命令仅作为数据保存。
+当前可在本地用合成账号提交任务、核对入队回执，并在「我的任务」查看全局队位和等待原因。显存可以未知，任务命令仅作为数据保存。
 
 ## 本地启动
 
@@ -17,6 +17,8 @@ $env:LABQUEUE_DEMO_B_PASSWORD = Read-Host '为 demo-b 设置本地模拟密码'
 访问 <http://127.0.0.1:8000>，API 文档在 <http://127.0.0.1:8000/docs>。关闭终端中的服务按 `Ctrl+C`。
 
 登录后可用任务名和合成命令（例如 `echo synthetic-job`）提交，显存选择「未知」即可。任务保存在运行账号的私有目录，Windows 使用 `%LOCALAPPDATA%\LabQueue\labqueue.sqlite3`，Linux 使用 `~/.local/share/labqueue/labqueue.sqlite3`。服务重启后重新登录，可用原提交键核对回执。
+
+依次用 `demo-a` 和 `demo-b` 提交任务，再分别进入「我的任务」及其任务详情。两个账号各自只会看到本人任务。全局队位按确认入队的顺序跨组计算，库中原有的排队任务也计入队位。模拟输入初始设为两张卡均被占用。页面「刷新」只读取任务；晚到的旧版本不会覆盖较新的队位和原因。页面标为「上次确认」时，可刷新以获取当前快照。此页面使用浏览器的 Web Locks 和本地存储，在同一登录会话的多个窗口间核对版本。
 
 启动时会核验目录、主库和 SQLite 日志的实际权限。若旧版本的 `data/labqueue.sqlite3` 仍有任务，先停服，通过 SQLite 备份接口将完整数据库迁入上述私有目录。核对任务数和原提交回执后，再处置旧副本。
 
@@ -55,10 +57,10 @@ $env:LABQUEUE_DEMO_B_PASSWORD = Read-Host '为 demo-b 设置本地模拟密码'
 .\.tools\python\bin\uv.exe run --locked python scripts/check_env.py
 .\.tools\python\bin\uv.exe run --locked ruff check .
 .\.tools\python\bin\uv.exe run --locked pytest -q
-node --test tests/submission_page.test.cjs
+node --test tests/submission_page.test.cjs tests/tasks_page.test.cjs
 ```
 
-测试使用独立临时 SQLite 库和合成账号，覆盖 Story 1.1 的提交、权限校验、核对与幂等重放。Node 测试校验表单的回执核对、手动重试和字段反馈。
+测试使用独立临时 SQLite 库和合成账号。Story 1.1 覆盖提交、权限校验、回执核对及幂等重放。Story 1.2 覆盖跨组队位、重启、只读权限和 WAL 快照一致性。Node 测试覆盖提交反馈，以及列表和详情在乱序响应、切页和重开时的版本保护。
 
 ## 团队与 AI 使用声明
 
