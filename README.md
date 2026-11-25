@@ -2,18 +2,23 @@
 
 面向研究生的共用 GPU 排队项目：一台服务器、两张 L20、多个研究组，普通用户权限部署。
 
-当前交付是 **BMAD 作业环境与项目骨架**。本地首页、健康接口可以运行；账号、队列、GPU 监测和任务执行尚未实现。没有运行任何训练或 GPU 实验。
+当前可在本地用合成账号提交任务和核对入队回执。显存可以未知，任务命令仅作为数据保存。
 
 ## 本地启动
 
-已搭建的 Windows 环境：
+在仓库根目录为合成账号设置本次本地运行的密码，再启动服务。`demo-a` 属于 `group-a`，`demo-b` 属于 `group-b`，组映射在服务端预置。
 
 ```powershell
-Set-Location 'F:\Postgraduate Eng\Homework\LabQueue'
+$env:LABQUEUE_DEMO_A_PASSWORD = Read-Host '为 demo-a 设置本地模拟密码'
+$env:LABQUEUE_DEMO_B_PASSWORD = Read-Host '为 demo-b 设置本地模拟密码'
 .\scripts\dev.ps1
 ```
 
 访问 <http://127.0.0.1:8000>，API 文档在 <http://127.0.0.1:8000/docs>。关闭终端中的服务按 `Ctrl+C`。
+
+登录后可用任务名和合成命令（例如 `echo synthetic-job`）提交，显存选择「未知」即可。任务保存在运行账号的私有目录，Windows 使用 `%LOCALAPPDATA%\LabQueue\labqueue.sqlite3`，Linux 使用 `~/.local/share/labqueue/labqueue.sqlite3`。服务重启后重新登录，可用原提交键核对回执。
+
+启动时会核验目录、主库和 SQLite 日志的实际权限。若旧版本的 `data/labqueue.sqlite3` 仍有任务，先停服，通过 SQLite 备份接口将完整数据库迁入上述私有目录。核对任务数和原提交回执后，再处置旧副本。
 
 首次在另一台 Windows 机器安装：先准备 Python ≥ 3.10 和 Node.js ≥ 20.12，再执行：
 
@@ -40,7 +45,7 @@ Set-Location 'F:\Postgraduate Eng\Homework\LabQueue'
 - 每位研究生所属研究组需要可信确认；公平策略需要兼顾组间和组内等待。
 - 首次显存未知的任务需要保守准入。初期每卡最多一个平台任务，运行中记录实际显存；历史采样不能保证未来峰值。
 - 不终止其他用户的进程，不把所有人的命令放到同一个 Linux 身份下执行。
-- 本阶段只在本地搭建和检查环境，真实 GPU 运行方案在架构评审时确定。
+- 当前本地功能使用合成账号和任务数据。真实 GPU 运行方案遵循架构评审条件。
 
 详见 [项目上下文](_bmad-output/project-context.md) 与 [AGENTS.md](AGENTS.md)。
 
@@ -49,9 +54,11 @@ Set-Location 'F:\Postgraduate Eng\Homework\LabQueue'
 ```powershell
 .\.tools\python\bin\uv.exe run --locked python scripts/check_env.py
 .\.tools\python\bin\uv.exe run --locked ruff check .
+.\.tools\python\bin\uv.exe run --locked pytest -q
+node --test tests/submission_page.test.cjs
 ```
 
-这是启动和代码检查，不代表真实服务器调度、公平性或 NFR 验证通过。
+测试使用独立临时 SQLite 库和合成账号，覆盖 Story 1.1 的提交、权限校验、核对与幂等重放。Node 测试校验表单的回执核对、手动重试和字段反馈。
 
 ## 团队与 AI 使用声明
 

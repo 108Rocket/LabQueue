@@ -7,7 +7,7 @@ architecture_reviewed: false
 
 # LabQueue 项目上下文
 
-本文件记录供后续 BMAD 工作流使用的实现约束。规则依据当前 PRD 的 FR/NFR、架构 AD-1 至 AD-8、4 个 Epic／16 个 Story 草案及 D-005 至 D-011。本仓库仍处于环境搭建阶段，M1/M2 待通过，模拟验收待完成。通过 M1/M2 后方可进入功能实施。
+本文件记录供后续 BMAD 工作流使用的实现约束。规则依据当前 PRD 的 FR/NFR、架构 AD-1 至 AD-8、4 个 Epic／16 个 Story 草案及 D-005 至 D-011。M1/M2 已通过[组内评审](planning-artifacts/m2-readiness-preflight.md#m1m2-组内评审记录)，项目成员已确认进入 M3，不等于课程签核。Story 1.1 已通过 Windows 本地模拟验收；完整模拟验收待完成。
 
 实施依据见 [PRD](planning-artifacts/prds/prd-LabQueue-2026-11-18/prd.md)、[架构与 ADR](planning-artifacts/architecture.md)、[Epic 与 Story](planning-artifacts/epics.md)、[决策日志](../decision-log.md)和[课程要求](../docs/course-requirements.md)。
 
@@ -21,7 +21,7 @@ architecture_reviewed: false
 | BMAD | 6.12.1，core + bmm，Codex 集成 |
 | FastAPI / Jinja2 | 0.143.0 / 3.1.6；本地 HTTP 骨架与页面 |
 | Uvicorn / SQLAlchemy | 0.54.0 / 2.1.4；开发服务与持久化库 |
-| SQLite | Python 内置，AD-1 规定模拟首版采用单主机 SQLite；业务数据库尚未创建 |
+| SQLite | Python 内置，AD-1 规定模拟首版采用单主机 SQLite；Story 1.1 使用运行账号的私有目录保存本地任务 |
 | httpx / pytest / Ruff | 0.28.1 / 9.1.1 / 0.17.0；检查工具 |
 | NVIDIA 监测 | `gpu` 可选依赖组；当前本地未启用，无 GPU 实测 |
 
