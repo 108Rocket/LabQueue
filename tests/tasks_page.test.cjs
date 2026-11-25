@@ -162,6 +162,39 @@ for (const detail of [false, true]) {
     assert.deepEqual([...shared.values], [[versionKey, "9007199254740994"]]);
   });
 
+  test(`${view}显示观测故障、过期及恢复，拒绝迟到的旧观测结果`, async () => {
+    const shared = makeSharedVersionStore();
+    const page = makePage(detail, shared);
+    const observation = (version, reason) => snapshot(detail, version, { waiting_reason: reason });
+    page.reply(0, observation("1", "waiting_dispatch"));
+    await settle();
+    assert.match(page.rows(), /等待调度/);
+
+    const lateAvailable = page.refresh();
+    const failed = page.refresh();
+    page.reply(2, observation("3", "gpu_monitoring_failed"));
+    await failed;
+    page.reply(1, observation("2", "waiting_dispatch"));
+    await lateAvailable;
+    assert.match(page.rows(), /模拟 GPU 监测失败，暂停派发/);
+    assert.doesNotMatch(page.rows(), /等待调度/);
+
+    const expired = page.refresh();
+    page.reply(3, observation("4", "gpu_observation_expired"));
+    await expired;
+    assert.match(page.rows(), /模拟 GPU 观测已过期，暂停派发/);
+
+    const lateExpired = page.refresh();
+    const restored = page.refresh();
+    page.reply(5, observation("6", "waiting_dispatch"));
+    await restored;
+    page.reply(4, observation("5", "gpu_observation_expired"));
+    await lateExpired;
+    assert.match(page.rows(), /等待调度/);
+    assert.doesNotMatch(page.rows(), /过期|暂停派发/);
+    assert.equal(shared.values.get(versionKey), "6");
+  });
+
   test(`${view}拒绝缺版本、不可比较版本或不完整的快照`, async () => {
     const shared = makeSharedVersionStore();
     const page = makePage(detail, shared);

@@ -11,6 +11,12 @@ from uuid import UUID, uuid4
 from pydantic import UUID4, BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from labqueue.auth import Account
+from labqueue.observations import (
+    SimulatedObservations,
+    WaitingReason,
+    initialize_observations,
+    read_admission,
+)
 from labqueue.storage import prepare_storage, verify_storage
 
 LOCK_WAIT_SECONDS = 2
@@ -38,9 +44,6 @@ class Receipt(BaseModel):
     queued_at: datetime
     memory_gib: Decimal | None
     status: Literal["queued"] = "queued"
-
-
-WaitingReason = Literal["gpu_busy", "gpu_visibility_unknown"]
 
 
 class TaskView(BaseModel):
@@ -94,7 +97,7 @@ class SubmissionStore:
             raise
         return db
 
-    def initialize(self) -> None:
+    def initialize(self) -> SimulatedObservations:
         prepare_storage(self.path)
         with closing(self._connect()) as db:
             if db.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
@@ -143,22 +146,9 @@ class SubmissionStore:
                     UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1;
                 END;
                 """)
-            observation_table = db.execute("""
-                SELECT 1 FROM sqlite_schema
-                WHERE type = 'table' AND name = 'simulated_gpu_observations'
-                """).fetchone()
-            if observation_table is None:
-                # 仅迁移时构造双卡占用，重启保留已提交的观测状态。
-                db.execute("""
-                    CREATE TABLE simulated_gpu_observations (
-                        slot INTEGER PRIMARY KEY CHECK (slot IN (0, 1)),
-                        occupancy TEXT NOT NULL CHECK (occupancy IN ('busy', 'unknown'))
-                    )
-                    """)
-                db.execute("""
-                    INSERT INTO simulated_gpu_observations VALUES (0, 'busy'), (1, 'busy')
-                    """)
-            db.execute("COMMIT")
+            publisher = SimulatedObservations(self._connect, *initialize_observations(db))
+            publisher.commit_rotation(db)
+        return publisher
 
     def list_tasks(self, account: Account) -> TaskListSnapshot:
         version, tasks, _ = self._task_snapshot(account, task_id=None)
@@ -203,10 +193,7 @@ class SubmissionStore:
             version = db.execute(
                 "SELECT snapshot_version FROM queue_state WHERE id = 1"
             ).fetchone()[0]
-            busy_slots = db.execute("""
-                SELECT count(*) FROM simulated_gpu_observations WHERE occupancy = 'busy'
-                """).fetchone()[0]
-            reason: WaitingReason = "gpu_busy" if busy_slots == 2 else "gpu_visibility_unknown"
+            reason = read_admission(db).waiting_reason
             if task_id is None:
                 rows = db.execute(
                     """WITH ranked AS (
