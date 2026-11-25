@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LabQueue · 模拟任务提交</title>
+  <title>LabQueue · {{ '任务详情' if task_id else '我的任务' if task_view else '模拟任务提交' }}</title>
   <style>
     body { margin: 0; background: #f3f6fa; color: #172235; font: 16px/1.6 system-ui, sans-serif; }
     main { max-width: 600px; margin: 4vh auto; padding: clamp(20px, 5vw, 40px); background: white; border-radius: 16px; }
@@ -25,13 +25,16 @@
     .field-error:not(:empty) { display: block; margin-top: .25rem; }
     footer { margin-top: 2rem; }
     a { color: #225bb5; }
+    nav { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1rem; }
+    #task-results { overflow-wrap: anywhere; }
+    #task-results article + article { border-top: 1px solid #d8e0ea; }
   </style>
   <script src="/static/submission.js" defer></script>
+  {% if session and task_view %}<script src="/static/tasks.js" defer></script>{% endif %}
 </head>
 <body>
   <main>
     <h1>LabQueue</h1>
-    <p class="help">模拟任务提交。请使用合成数据，任务命令仅保存。</p>
     {% if session %}
     <div class="session" id="session" data-owner="{{ session.account.owner_id }}"
          data-csrf="{{ session.csrf_token }}">
@@ -39,6 +42,20 @@
       <button type="button" id="logout">退出登录</button>
     </div>
     <p id="session-feedback" class="feedback error" role="status"></p>
+    <nav aria-label="任务导航">
+      <a href="/"{% if not task_view %} aria-current="page"{% endif %}>提交任务</a>
+      <a href="/tasks"{% if task_view and not task_id %} aria-current="page"{% endif %}>我的任务</a>
+    </nav>
+    {% if task_view %}
+    <section id="tasks-page" data-snapshot-scope="{{ session.snapshot_scope }}"
+             {% if task_id %}data-task-id="{{ task_id }}"{% endif %}>
+      <h2>{{ '任务详情' if task_id else '我的任务' }}</h2>
+      <button id="refresh-tasks" type="button">刷新</button>
+      <p id="tasks-feedback" class="feedback" role="status"></p>
+      <div id="task-results" aria-describedby="tasks-feedback"></div>
+    </section>
+    {% else %}
+    <p class="help">请使用合成数据，任务命令仅保存。</p>
     <h2>提交任务</h2>
     <form id="submission" method="post" autocomplete="off">
       <fieldset id="submission-fields">
@@ -75,6 +92,7 @@
       <button type="submit">核对回执</button>
     </form>
     <p id="lookup-feedback" class="feedback" role="status"></p>
+    {% endif %}
     {% else %}
     <h2>登录合成账号</h2>
     <form id="login" method="post">

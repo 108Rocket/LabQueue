@@ -1,0 +1,361 @@
+const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
+const { setImmediate: settle } = require("node:timers/promises");
+const { test } = require("node:test");
+const { runInNewContext } = require("node:vm");
+
+const scripts = ["submission.js", "tasks.js"].map((file) =>
+  readFileSync(join(__dirname, "../src/labqueue/static", file), "utf8")
+).join("\n");
+const taskId = "83f45969-1db4-4ac7-91c7-c16f361baf16";
+const versionKey = "labqueue.task-version.test-session";
+const task = {
+  task_id: taskId, name: "合成任务", enqueue_seq: "2", queued_at: "2026-11-25T01:02:03.000001Z",
+  status: "queued", queue_position: 2, waiting_reason: "gpu_busy", can_cancel: false,
+};
+
+function snapshot(detail, version, changes = {}) {
+  const row = { ...task, ...changes };
+  return detail ? { snapshot_version: version, task: row } : { snapshot_version: version, tasks: [row] };
+}
+
+function makeSharedVersionStore() {
+  const values = new Map();
+  const pending = new Map();
+  const heldLocks = new Set();
+  const locks = {
+    request(key, callback) {
+      const work = (pending.get(key) || Promise.resolve()).then(() => {
+        heldLocks.add(key);
+        try {
+          return callback();
+        } finally {
+          heldLocks.delete(key);
+        }
+      });
+      pending.set(key, work.catch(() => {}));
+      return work;
+    },
+  };
+  return { values, locks, heldLocks, available: true };
+}
+
+function makePage(detail, shared = makeSharedVersionStore()) {
+  const makeElement = (tag) => {
+    const handlers = new Map();
+    return {
+      tag, children: [], textContent: "", dataset: {},
+      append(...children) { this.children.push(...children); },
+      replaceChildren(...children) { this.children = children; },
+      addEventListener(type, handler) { handlers.set(type, handler); },
+      fire(type, event) { return handlers.get(type)(event); },
+    };
+  };
+  const elements = new Map(["session", "logout", "session-feedback", "tasks-page", "refresh-tasks",
+    "tasks-feedback", "task-results"].map((id) => [id, makeElement(id)]));
+  elements.get("session").dataset.csrf = "test-csrf-token";
+  elements.get("tasks-page").dataset.snapshotScope = "test-session";
+  if (detail) elements.get("tasks-page").dataset.taskId = taskId;
+  const pageWindow = makeElement("window");
+  const fetches = [];
+  runInNewContext(scripts, {
+    document: {
+      getElementById: (id) => elements.get(id) || null,
+      createElement: makeElement,
+      createDocumentFragment: () => makeElement("fragment"),
+    },
+    navigator: { locks: shared.locks },
+    localStorage: {
+      getItem(key) {
+        assert.ok(shared.heldLocks.has(key));
+        if (!shared.available) throw new Error("storage unavailable");
+        return shared.values.get(key) ?? null;
+      },
+      setItem(key, value) {
+        assert.ok(shared.heldLocks.has(key));
+        if (!shared.available) throw new Error("storage unavailable");
+        shared.values.set(key, value);
+      },
+    },
+    window: pageWindow, AbortSignal,
+    fetch(path, options) {
+      assert.equal(path, detail ? `/api/tasks/${taskId}` : "/api/tasks");
+      assert.equal(options.method, "GET");
+      assert.equal(options.headers["X-CSRF-Token"], "test-csrf-token");
+      assert.ok(options.signal instanceof AbortSignal);
+      return new Promise((resolve) => fetches.push((body, status = 200) => {
+        resolve({ status, ok: status === 200, json: async () => body });
+      }));
+    },
+  });
+
+  function textOf(element) {
+    return [element.textContent, ...element.children.map(textOf)].filter(Boolean).join("\n");
+  }
+  function linksOf(element) {
+    return element.tag === "a" ? [element] : element.children.flatMap(linksOf);
+  }
+  return {
+    refresh: () => elements.get("refresh-tasks").fire("click"),
+    fire: (event, fields) => pageWindow.fire(event, fields),
+    reply: (index, ...args) => fetches[index](...args),
+    rows: () => textOf(elements.get("task-results")),
+    links: () => linksOf(elements.get("task-results")),
+    feedback: () => textOf(elements.get("tasks-feedback")),
+  };
+}
+
+for (const detail of [false, true]) {
+  const view = detail ? "详情" : "列表";
+  test(`${view}保留较新的队位与原因，按精确十进制版本比较`, async () => {
+    const shared = makeSharedVersionStore();
+    const page = makePage(detail, shared);
+    const newer = page.refresh();
+    page.reply(1, snapshot(detail, "9007199254740993", { queue_position: 1 }));
+    await newer;
+    page.reply(0, snapshot(detail, "9007199254740992"));
+    await settle();
+    assert.match(page.rows(), /全局队位 1/);
+    assert.match(page.rows(), /两张模拟 GPU 均被占用/);
+    assert.equal(page.feedback(), "已更新任务。");
+    assert.equal(shared.values.get(versionKey), "9007199254740993");
+
+    const oldReason = page.refresh();
+    const newReason = page.refresh();
+    page.reply(3, snapshot(detail, "9007199254740994", {
+      queue_position: 1, waiting_reason: "gpu_visibility_unknown",
+    }));
+    await newReason;
+    page.reply(2, snapshot(detail, "9007199254740993", { queue_position: 1 }));
+    await oldReason;
+    assert.match(page.rows(), /全局队位 1/);
+    assert.match(page.rows(), /模拟 GPU 占用状态待确认/);
+    assert.doesNotMatch(page.rows(), /两张模拟 GPU 均被占用|取消任务/);
+    assert.deepEqual([...shared.values], [[versionKey, "9007199254740994"]]);
+  });
+
+  test(`${view}拒绝缺版本、不可比较版本或不完整的快照`, async () => {
+    const shared = makeSharedVersionStore();
+    const page = makePage(detail, shared);
+    const good = snapshot(detail, "2");
+    page.reply(0, good);
+    await settle();
+    const before = page.rows();
+    assert.match(before, /全局队位 2/);
+    const invalid = [
+      { ...good, snapshot_version: undefined },
+      { ...good, snapshot_version: 10 },
+      { ...good, snapshot_version: "10\n" },
+      snapshot(detail, "10", { waiting_reason: undefined }),
+      snapshot(detail, "10", { can_cancel: true }),
+      detail ? snapshot(true, "10", { task_id: "98557b23-2905-4cbb-8dfe-e359f51badc8" })
+        : { snapshot_version: "10", task },
+    ];
+    for (const [i, bad] of invalid.entries()) {
+      const refresh = page.refresh();
+      page.reply(i + 1, bad);
+      await refresh;
+      assert.equal(page.rows(), before);
+      assert.match(page.feedback(), /上次确认/);
+      assert.equal(shared.values.get(versionKey), "2");
+    }
+  });
+}
+
+test("不可见的原任务名保留有效快照并用任务编号提供列表链接", async () => {
+  const shared = makeSharedVersionStore();
+  const list = makePage(false, shared);
+  const detail = makePage(true, shared);
+  list.reply(0, snapshot(false, "2", { name: "\uFEFF" }));
+  detail.reply(0, snapshot(true, "2", { name: "\uFEFF" }));
+  await settle();
+  const [link] = list.links();
+  assert.equal(link.href, `/tasks/${taskId}`);
+  assert.equal(link.textContent, `任务 ${taskId}`);
+  for (const page of [list, detail]) {
+    assert.match(page.rows(), new RegExp(`任务 ${taskId}`));
+    assert.match(page.rows(), /确认时间 2026-11-25 01:02:03 UTC/);
+    assert.equal(page.feedback(), "已更新任务。");
+  }
+});
+
+test("同版本刷新保留任务链接节点，让键盘焦点留在原处", async () => {
+  const page = makePage(false);
+  page.reply(0, snapshot(false, "2"));
+  await settle();
+  const [link] = page.links();
+  assert.equal(link.href, `/tasks/${taskId}`);
+
+  const refresh = page.refresh();
+  page.reply(1, snapshot(false, "2"));
+  await refresh;
+
+  assert.strictEqual(page.links()[0], link);
+  assert.equal(page.feedback(), "已更新任务。");
+});
+
+test("晚到的同版本成功响应不能清除较近一次刷新失败的上次确认提示", async () => {
+  const page = makePage(false);
+  page.reply(0, snapshot(false, "2"));
+  await settle();
+  const earlier = page.refresh();
+  const later = page.refresh();
+  page.reply(2, {}, 503);
+  await later;
+  const lastConfirmed = page.feedback();
+  assert.match(lastConfirmed, /上次确认/);
+  page.reply(1, snapshot(false, "2"));
+  await earlier;
+  assert.equal(page.feedback(), lastConfirmed);
+
+  const fresh = page.refresh();
+  page.reply(3, snapshot(false, "2"));
+  await fresh;
+  assert.equal(page.feedback(), "已更新任务。");
+});
+
+test("列表提高版本下限后，详情缓存、迟到和重开画面遵循同一版本", async () => {
+  const shared = makeSharedVersionStore();
+  const list = makePage(false, shared);
+  const detail = makePage(true, shared);
+  list.reply(0, snapshot(false, "2"));
+  detail.reply(0, snapshot(true, "2"));
+  await settle();
+  const oldDetail = detail.refresh();
+  const newList = list.refresh();
+  list.reply(1, snapshot(false, "3", { queue_position: 1, waiting_reason: "gpu_visibility_unknown" }));
+  await newList;
+  await detail.fire("storage", { key: versionKey });
+  assert.match(detail.feedback(), /上次确认/);
+  detail.reply(1, snapshot(true, "2"));
+  await oldDetail;
+  assert.match(detail.feedback(), /上次确认/);
+  assert.match(detail.rows(), /全局队位 2/);
+
+  for (const detailView of [false, true]) {
+    const reopened = makePage(detailView, shared);
+    reopened.reply(0, snapshot(detailView, "2"));
+    await settle();
+    assert.equal(reopened.rows(), "");
+    assert.match(reopened.feedback(), /尚未取得当前任务/);
+  }
+
+  const returned = detail.fire("pageshow", { persisted: true });
+  assert.match(detail.feedback(), /上次确认/);
+  await settle();
+  detail.reply(2, snapshot(true, "3", { queue_position: 1, waiting_reason: "gpu_visibility_unknown" }));
+  await returned;
+  assert.equal(detail.feedback(), "已更新任务。");
+  assert.match(detail.rows(), /全局队位 1/);
+  assert.match(detail.rows(), /待确认/);
+
+  detail.fire("pagehide", { persisted: true });
+  assert.match(detail.feedback(), /上次确认/);
+  const changeWhileHidden = list.refresh();
+  list.reply(2, snapshot(false, "4", { queue_position: 1 }));
+  await changeWhileHidden;
+  const restored = detail.fire("pageshow", { persisted: true });
+  await settle();
+  detail.reply(3, snapshot(true, "3", { queue_position: 1, waiting_reason: "gpu_visibility_unknown" }));
+  await restored;
+  assert.match(detail.feedback(), /上次确认/);
+  assert.match(detail.rows(), /模拟 GPU 占用状态待确认/);
+  assert.equal(shared.values.get(versionKey), "4");
+});
+
+test("读取失败时保留画面，并提示浏览器版本协调所需能力", async () => {
+  const shared = makeSharedVersionStore();
+  const detail = makePage(true, shared);
+  detail.reply(0, snapshot(true, "2"));
+  await settle();
+  const before = detail.rows();
+
+  const failed = detail.refresh();
+  detail.reply(1, {}, 503);
+  await failed;
+  assert.equal(detail.rows(), before);
+  assert.match(detail.feedback(), /上次确认/);
+
+  shared.available = false;
+  const unverified = detail.refresh();
+  detail.reply(2, snapshot(true, "3", { queue_position: 1 }));
+  await unverified;
+  assert.equal(detail.rows(), before);
+  assert.match(detail.feedback(), /上次确认。请允许访问浏览器本地存储/);
+
+  const withoutLocks = makeSharedVersionStore();
+  withoutLocks.locks = undefined;
+  const page = makePage(false, withoutLocks);
+  page.reply(0, snapshot(false, "3"));
+  await settle();
+  assert.equal(page.rows(), "");
+  assert.match(page.feedback(), /需要支持 Web Locks/);
+});
+
+test("详情按共享版本核对不存在，缺版本或较旧的 404 不会清空较新画面", async () => {
+  const shared = makeSharedVersionStore();
+  const detail = makePage(true, shared);
+  detail.reply(0, snapshot(true, "3", { queue_position: 1 }));
+  await settle();
+  const before = detail.rows();
+  const earlier404 = detail.refresh();
+  detail.reply(1, { snapshot_version: "2" }, 404);
+  await earlier404;
+  assert.equal(detail.rows(), before);
+  assert.equal(detail.feedback(), "已更新任务。");
+  assert.equal(shared.values.get(versionKey), "3");
+
+  const unversioned404 = detail.refresh();
+  detail.reply(2, {}, 404);
+  await unversioned404;
+  assert.equal(detail.rows(), before);
+  assert.match(detail.feedback(), /上次确认/);
+
+  const list = makePage(false, shared);
+  list.reply(0, snapshot(false, "4"));
+  await settle();
+  const belowSharedFloor = detail.refresh();
+  detail.reply(3, { snapshot_version: "3" }, 404);
+  await belowSharedFloor;
+  assert.equal(detail.rows(), before);
+  assert.match(detail.feedback(), /上次确认/);
+
+  const older = detail.refresh();
+  const missing = detail.refresh();
+  detail.reply(5, { snapshot_version: "5" }, 404);
+  await missing;
+  assert.equal(detail.rows(), "");
+  assert.equal(detail.feedback(), "未找到该任务。");
+  detail.reply(4, snapshot(true, "4", { queue_position: 1 }));
+  await older;
+  assert.equal(detail.rows(), "");
+  assert.equal(detail.feedback(), "未找到该任务。");
+  assert.equal(shared.values.get(versionKey), "5");
+});
+
+for (const detail of [false, true]) {
+  const view = detail ? "详情" : "列表";
+  for (const status of [401, 403]) {
+    test(`${view}收到 ${status} 后，迟到的成功响应不能再显示任务`, async () => {
+      const shared = makeSharedVersionStore();
+      const page = makePage(detail, shared);
+      page.reply(0, snapshot(detail, "2"));
+      await settle();
+      assert.match(page.rows(), /全局队位 2/);
+
+      const earlier = page.refresh();
+      const denied = page.refresh();
+      page.reply(2, {}, status);
+      await denied;
+      assert.equal(page.rows(), "");
+      assert.match(page.feedback(), /会话已失效/);
+
+      page.reply(1, snapshot(detail, "3"));
+      await earlier;
+      assert.equal(page.rows(), "");
+      assert.match(page.feedback(), /会话已失效/);
+      assert.equal(shared.values.get(versionKey), "2");
+    });
+  }
+}
