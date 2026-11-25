@@ -1,4 +1,14 @@
 const byId = (id) => document.getElementById(id);
+const sessionChangeKey = "labqueue.session-change";
+
+function notifySessionChange() {
+  try {
+    // 存储事件只唤醒其他标签页核对 Cookie，不保存任何身份凭证。
+    localStorage.setItem(sessionChangeKey, crypto.randomUUID());
+  } catch {
+    // 任务页也会在恢复可见或处理响应时复核会话。
+  }
+}
 
 async function request(path, { method = "GET", body, headers = {} } = {}) {
   const response = await fetch(path, {
@@ -30,6 +40,7 @@ if (loginForm) {
         headers: { "X-LabQueue-Request": "1" },
         body: { username: byId("username").value, password: byId("password").value },
       });
+      notifySessionChange();
       window.location.reload();
     } catch (error) {
       byId("login-feedback").textContent = error.status ? error.message : "暂时无法登录，请重试。";
@@ -227,6 +238,7 @@ if (session) {
   byId("logout").addEventListener("click", async () => {
     try {
       await request("/api/session", { method: "DELETE", headers: sessionHeaders });
+      notifySessionChange();
       window.location.reload();
     } catch (error) {
       if (error.status === 401 || error.status === 403) {

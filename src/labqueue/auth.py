@@ -7,6 +7,7 @@ from threading import Lock
 from time import monotonic
 
 SESSION_COOKIE = "labqueue_session"
+VIEW_SCOPE_COOKIE = "labqueue_view_scope"
 SESSION_SECONDS = 8 * 60 * 60
 
 
@@ -28,6 +29,9 @@ class DemoSessions:
     def __init__(self) -> None:
         self._accounts = {
             "demo-a": (Account("demo-a", "group-a"), os.getenv("LABQUEUE_DEMO_A_PASSWORD")),
+            "demo-a-peer": (
+                Account("demo-a-peer", "group-a"), os.getenv("LABQUEUE_DEMO_A_PEER_PASSWORD")
+            ),
             "demo-b": (Account("demo-b", "group-b"), os.getenv("LABQUEUE_DEMO_B_PASSWORD")),
         }
         self._sessions: dict[str, Session] = {}

@@ -1,9 +1,11 @@
 const taskPage = byId("tasks-page");
 const detailId = taskPage.dataset.taskId;
 const taskPath = detailId ? `/api/tasks/${encodeURIComponent(detailId)}` : "/api/tasks";
-const versionKey = `labqueue.task-version.${taskPage.dataset.snapshotScope}`;
+const snapshotScope = taskPage.dataset.snapshotScope;
+const versionKey = `labqueue.task-version.${snapshotScope}`;
 const taskFeedback = byId("tasks-feedback");
 const taskResults = byId("task-results");
+const refreshButton = byId("refresh-tasks");
 const waitingReasons = {
   gpu_busy: "两张模拟 GPU 均被占用。",
   gpu_visibility_unknown: "模拟 GPU 占用状态待确认。",
@@ -16,6 +18,9 @@ let displayedVersion = null;
 let lastRequest = 0;
 let reportedRequest = 0;
 let sessionValid = true;
+let sessionCheck = null;
+let pageSuspended = false;
+let readEpoch = 0;
 
 class VersionCoordinationError extends Error {}
 
@@ -48,11 +53,32 @@ function isTaskView(task) {
 function readTaskRows(snapshot) {
   if (!isDecimal(snapshot?.snapshot_version)) throw new Error("Invalid snapshot version");
   if (detailId) {
-    if (isTaskView(snapshot.task) && snapshot.task.task_id === detailId) return [snapshot.task];
+    if (isTaskView(snapshot.task) && snapshot.task.task_id === detailId
+        && (snapshot.output_id === undefined
+          || (typeof snapshot.output_id === "string" && taskUuid.test(snapshot.output_id)))) {
+      return [snapshot.task];
+    }
   } else if (Array.isArray(snapshot.tasks) && snapshot.tasks.every(isTaskView)) {
     return snapshot.tasks;
   }
   throw new Error("Incomplete task snapshot");
+}
+
+function invalidateTaskSession() {
+  sessionValid = false;
+  displayedVersion = null;
+  taskResults.replaceChildren();
+  refreshButton.disabled = true;
+  taskFeedback.textContent = "会话已失效，请刷新页面继续。";
+}
+
+function checkTaskSession() {
+  if (sessionValid && !document.cookie.split(";").some(
+    (cookie) => cookie.trim() === `labqueue_view_scope=${snapshotScope}`,
+  )) {
+    invalidateTaskSession();
+  }
+  return sessionValid;
 }
 
 function markLastConfirmed(message) {
@@ -73,7 +99,7 @@ function withVersionFloor(useFloor) {
   }
   // Web Locks 将不同页面的读取、比较和持久写入串成同一临界区。
   return navigator.locks.request(versionKey, () => {
-    if (!sessionValid) return;
+    if (!checkTaskSession() || pageSuspended) return;
     const stored = accessVersionStorage(() => localStorage.getItem(versionKey));
     if (stored !== null && !isDecimal(stored)) {
       throw new VersionCoordinationError("无法核对本地任务版本，请重新登录。");
@@ -86,7 +112,7 @@ function withVersionFloor(useFloor) {
   });
 }
 
-function taskCard(task) {
+function taskCard(task, outputId) {
   const card = document.createElement("article");
   const heading = document.createElement("h3");
   const name = /[^\p{White_Space}\p{Default_Ignorable_Code_Point}\p{Cc}]/u.test(task.name)
@@ -113,13 +139,51 @@ function taskCard(task) {
   const confirmation = `确认时间 ${confirmedAt}`;
   registration.textContent = detailId ? `入队序号 ${task.enqueue_seq} · ${confirmation}` : confirmation;
   card.append(registration);
+  if (outputId) addOutputControl(card, outputId);
   return card;
+}
+
+function addOutputControl(card, outputId) {
+  const button = document.createElement("button");
+  const feedback = document.createElement("p");
+  feedback.setAttribute("role", "status");
+  button.type = "button";
+  button.textContent = "读取私有输出";
+  card.append(button, feedback);
+  button.addEventListener("click", async () => {
+    if (!checkTaskSession() || taskResults.hidden || button.disabled) return;
+    const epoch = readEpoch;
+    button.disabled = true;
+    feedback.textContent = "正在读取私有输出。";
+    try {
+      const output = await request(`${taskPath}/outputs/${encodeURIComponent(outputId)}`, {
+        headers: sessionHeaders,
+      });
+      if (sessionCheck) await sessionCheck;
+      if (epoch !== readEpoch || !checkTaskSession() || !taskResults.contains(card)) return;
+      if (typeof output?.text !== "string") throw new Error("Invalid task output");
+      const content = document.createElement("pre");
+      content.textContent = output.text;
+      feedback.textContent = "已读取私有输出。";
+      card.append(content);
+    } catch (error) {
+      if (epoch !== readEpoch) return;
+      if (error.status === 401 || error.status === 403) invalidateTaskSession();
+      else if (checkTaskSession() && taskResults.contains(card)) {
+        feedback.textContent = "暂时无法读取输出，请重试。";
+        button.disabled = false;
+      }
+    }
+  });
 }
 
 async function readTasks() {
   try {
     const snapshot = await request(taskPath, { headers: sessionHeaders });
-    return { version: snapshot.snapshot_version, tasks: readTaskRows(snapshot) };
+    return {
+      version: snapshot.snapshot_version, tasks: readTaskRows(snapshot),
+      outputId: detailId ? snapshot.output_id : null,
+    };
   } catch (error) {
     if (detailId && error.status === 404 && isDecimal(error.snapshotVersion)) {
       return { version: error.snapshotVersion, tasks: null };
@@ -134,26 +198,30 @@ function showReadFailure(error) {
 }
 
 async function refreshTasks() {
-  if (!sessionValid) return;
+  if (!checkTaskSession() || pageSuspended) return;
+  const epoch = readEpoch;
   const requestNumber = ++lastRequest;
   if (displayedVersion === null) taskFeedback.textContent = "正在读取任务。";
   try {
-    const { version, tasks } = await readTasks();
+    const { version, tasks, outputId } = await readTasks();
+    if (sessionCheck) await sessionCheck;
     await withVersionFloor((stored) => {
+      if (epoch !== readEpoch) return;
       if (earlierVersion(version, versionFloor)) {
-        if (displayedVersion === null && requestNumber === lastRequest) {
+        if ((taskResults.hidden || displayedVersion === null) && requestNumber === lastRequest) {
           markLastConfirmed("尚未取得当前任务，请刷新此页。");
         }
         return;
       }
       if (version === displayedVersion && requestNumber < reportedRequest) return;
       if (stored !== version) accessVersionStorage(() => localStorage.setItem(versionKey, version));
-      // 同版本只更新核对反馈，保留任务链接和键盘焦点。
-      if (version !== displayedVersion) {
+      // 已显示的同版本只更新反馈。历史恢复重新构建卡片，丢弃旧输出和读取状态。
+      if (taskResults.hidden || version !== displayedVersion) {
         const cards = document.createDocumentFragment();
-        for (const task of tasks ?? []) cards.append(taskCard(task));
+        for (const task of tasks ?? []) cards.append(taskCard(task, outputId));
         taskResults.replaceChildren(cards);
       }
+      taskResults.hidden = false;
       versionFloor = version;
       displayedVersion = version;
       reportedRequest = Math.max(requestNumber, reportedRequest);
@@ -162,11 +230,8 @@ async function refreshTasks() {
     });
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
-      sessionValid = false;
-      displayedVersion = null;
-      taskResults.replaceChildren();
-      taskFeedback.textContent = "会话已失效，请重新登录。";
-    } else if (requestNumber === lastRequest && sessionValid) {
+      invalidateTaskSession();
+    } else if (epoch === readEpoch && requestNumber === lastRequest && checkTaskSession()) {
       reportedRequest = requestNumber;
       showReadFailure(error);
     }
@@ -177,19 +242,38 @@ async function recheckVersionFloor() {
   try {
     await withVersionFloor();
   } catch (error) {
-    if (sessionValid) showReadFailure(error);
+    if (checkTaskSession() && !taskResults.hidden) showReadFailure(error);
   }
 }
 
-byId("refresh-tasks").addEventListener("click", refreshTasks);
+refreshButton.addEventListener("click", refreshTasks);
 window.addEventListener("storage", (event) => {
+  if (!checkTaskSession()) return;
   if (event.key === versionKey || event.key === null) return recheckVersionFloor();
 });
+function checkVisibleSession() {
+  if (document.visibilityState !== "visible" || pageSuspended || !checkTaskSession()) return;
+  sessionCheck ??= request("/api/session", { headers: sessionHeaders })
+    .catch((error) => {
+      if (error.status === 401 || error.status === 403) invalidateTaskSession();
+    })
+    .finally(() => { sessionCheck = null; });
+  return sessionCheck;
+}
+
+document.addEventListener("visibilitychange", checkVisibleSession);
+// 退出响应丢失时，按服务端的会话状态清屏。
+window.setInterval(checkVisibleSession, 2000);
 window.addEventListener("pagehide", (event) => {
-  if (event.persisted && displayedVersion !== null) markLastConfirmed("返回时重新核对任务。");
+  if (!event.persisted) return;
+  pageSuspended = true;
+  readEpoch += 1;
+  taskResults.hidden = true;
+  if (displayedVersion !== null) markLastConfirmed("返回时重新核对任务。");
 });
 window.addEventListener("pageshow", async (event) => {
-  if (!event.persisted) return;
+  if (!event.persisted || !checkTaskSession()) return;
+  pageSuspended = false;
   if (displayedVersion !== null) markLastConfirmed("正在重新核对任务。");
   await recheckVersionFloor();
   await refreshTasks();

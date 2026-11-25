@@ -62,6 +62,11 @@ class TaskListSnapshot(BaseModel):
 class TaskDetailSnapshot(BaseModel):
     snapshot_version: str
     task: TaskView
+    output_id: UUID | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class TaskOutput(BaseModel):
+    text: str
 
 
 class SubmissionConflict(Exception):
@@ -81,6 +86,7 @@ class SubmissionStore:
         try:
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA synchronous = FULL")
+            db.execute("PRAGMA foreign_keys = ON")
             if db.execute("PRAGMA synchronous").fetchone()[0] != 2:
                 raise RuntimeError("SQLite 未启用 synchronous=FULL")
         except BaseException:
@@ -119,6 +125,23 @@ class SubmissionStore:
                 );
                 CREATE INDEX IF NOT EXISTS queued_by_sequence ON tasks (enqueue_seq)
                     WHERE status = 'queued';
+                CREATE TABLE IF NOT EXISTS task_outputs (
+                    output_id TEXT PRIMARY KEY NOT NULL,
+                    task_id TEXT NOT NULL UNIQUE REFERENCES tasks (task_id),
+                    text TEXT NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS task_output_inserted
+                AFTER INSERT ON task_outputs BEGIN
+                    UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS task_output_updated
+                AFTER UPDATE ON task_outputs BEGIN
+                    UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS task_output_deleted
+                AFTER DELETE ON task_outputs BEGIN
+                    UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1;
+                END;
                 """)
             observation_table = db.execute("""
                 SELECT 1 FROM sqlite_schema
@@ -138,16 +161,41 @@ class SubmissionStore:
             db.execute("COMMIT")
 
     def list_tasks(self, account: Account) -> TaskListSnapshot:
-        version, tasks = self._task_snapshot(account, task_id=None)
+        version, tasks, _ = self._task_snapshot(account, task_id=None)
         return TaskListSnapshot(snapshot_version=version, tasks=tasks)
 
-    def task_detail(self, account: Account, task_id: str) -> tuple[str, TaskView | None]:
-        version, tasks = self._task_snapshot(account, task_id)
-        return version, tasks[0] if tasks else None
+    def task_detail(self, account: Account, task_id: str) -> tuple[str, TaskDetailSnapshot | None]:
+        version, tasks, output_id = self._task_snapshot(account, task_id)
+        if not tasks:
+            return version, None
+        return version, TaskDetailSnapshot(
+            snapshot_version=version, task=tasks[0], output_id=output_id
+        )
+
+    @staticmethod
+    def owns_task(db: sqlite3.Connection, account: Account, task_id: str) -> bool:
+        """在调用者持有的事务内检查可信所有者。"""
+        return db.execute(
+            "SELECT 1 FROM tasks WHERE task_id = ? AND owner_id = ?",
+            (task_id, account.owner_id),
+        ).fetchone() is not None
+
+    def read_task_output(self, account: Account, task_id: str, output_id: str) -> TaskOutput | None:
+        with closing(self._connect()) as db:
+            db.execute("PRAGMA query_only = ON")
+            db.execute("BEGIN")
+            if not self.owns_task(db, account, task_id):
+                return None
+            row = db.execute(
+                "SELECT text FROM task_outputs WHERE task_id = ? AND output_id = ?",
+                (task_id, output_id),
+            ).fetchone()
+        return TaskOutput(text=row["text"]) if row is not None else None
 
     def _task_snapshot(
         self, account: Account, task_id: str | None
-    ) -> tuple[str, list[TaskView]]:
+    ) -> tuple[str, list[TaskView], str | None]:
+        output_id = None
         with closing(self._connect()) as db:
             db.execute("PRAGMA query_only = ON")
             db.execute("BEGIN")
@@ -172,17 +220,22 @@ class SubmissionStore:
                        WHERE t.owner_id = ? ORDER BY t.enqueue_seq""",
                     (account.owner_id,),
                 ).fetchall()
-            else:
+            elif self.owns_task(db, account, task_id):
                 rows = db.execute(
                     """SELECT t.task_id, t.name, t.enqueue_seq, t.queued_at, t.status,
+                              output.output_id,
                               CASE WHEN t.status = 'queued' THEN (
                                   SELECT count(*) + 1 FROM tasks AS earlier
                                   WHERE earlier.status = 'queued'
                                     AND earlier.enqueue_seq < t.enqueue_seq
                               ) END AS queue_position
-                       FROM tasks AS t WHERE t.owner_id = ? AND t.task_id = ?""",
-                    (account.owner_id, task_id),
+                       FROM tasks AS t LEFT JOIN task_outputs AS output USING (task_id)
+                       WHERE t.task_id = ?""",
+                    (task_id,),
                 ).fetchall()
+                output_id = rows[0]["output_id"]
+            else:
+                rows = []
         tasks = [
             TaskView(
                 task_id=row["task_id"],
@@ -195,7 +248,7 @@ class SubmissionStore:
             )
             for row in rows
         ]
-        return str(version), tasks
+        return str(version), tasks, output_id
 
     @staticmethod
     def _find(db: sqlite3.Connection, owner_id: str, key: UUID) -> sqlite3.Row | None:
