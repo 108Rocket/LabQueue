@@ -966,7 +966,10 @@ def test_end_is_atomic_and_original_gpu_handoff(client, database, monkeypatch, o
         assert end_state(observer, task_id) == after
     version, visible = owner_task(client, headers, task_id)
     assert (version, visible["status"]) == (after[2], status)
-    assert visible.get("failure_reason") == ("oom" if outcome == "oom" else None)
+    if outcome == "oom":
+        assert visible["failure_reason"] == "oom"
+    else:
+        assert "failure_reason" not in visible
     assert client.delete("/api/session", headers=headers).status_code == 204
     assert client.get(f"/api/tasks/{task_id}").status_code == 401
     for other in ("demo-a-peer", "demo-b"):

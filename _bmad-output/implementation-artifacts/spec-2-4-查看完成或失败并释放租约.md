@@ -2,7 +2,7 @@
 title: 'Story 2.4 查看完成或失败并释放租约'
 type: 'feature'
 created: '2026-11-26'
-status: 'in-review'
+status: 'done'
 baseline_commit: 'd32488098e513cc18e0931fa0414e3ac9c863f40'
 route: 'oneshot'
 review_loop_iteration: 0
@@ -36,7 +36,7 @@ review_loop_iteration: 0
 
 - Epic 3 接入真实的模拟取消与执行待核对裁决，核实与结果上报竞争时的提交顺序。
 - Epic 4 接入重领、旧报告隔离和重启恢复，汇总 NFR-01。真实 L20 的执行身份及进程树结束证据属 AD-8 条件目标。
-- 页面文案和交互待 UX 复核，Story 独立验收待进行。
+- 页面文案和交互待 UX 复核。
 
 ## 构建盲审处理
 
@@ -51,3 +51,11 @@ review_loop_iteration: 0
 - `uv run --locked pytest -q` 通过 128 项，有一条既有的 Starlette/httpx 弃用提示。
 - `node --test tests/submission_page.test.cjs tests/tasks_page.test.cjs` 通过 41 项。
 - `uv run --locked ruff check .`、`uv run --locked python scripts/check_env.py` 和 `git diff --check` 通过。启动检查使用 Python 3.12.15。
+
+## 2026-11-26 独立复审与收尾
+
+项目成员确认，独立复审基于提交 `30ff43be28fd521057d1e0830ed7c2a7c9ad0544`，结论为通过。
+
+补强现有 `test_end_is_atomic_and_original_gpu_handoff` 的 API 回归。用例逐字段比较本人列表与详情中的任务对象，再检查三种终态。正常完成和普通失败必须省略 `failure_reason`，即使返回 `null` 也会使测试失败。OOM 必须返回 `"failure_reason": "oom"`。
+
+补强后在 Windows 本地双卡模拟重跑全量检查。Python 测试 128 项通过，耗时 81.82 秒，有一条既有的 Starlette/httpx 弃用提示。Node 页面测试 41 项通过。Ruff、Python 3.12.15 启动检查和 Git 差异检查均通过。
