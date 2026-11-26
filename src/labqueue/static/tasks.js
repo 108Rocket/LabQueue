@@ -44,6 +44,8 @@ function isTaskView(task) {
       || typeof task.queued_at !== "string" || !utcTime.test(task.queued_at)
       || !Number.isFinite(Date.parse(task.queued_at))
       || typeof task.status !== "string" || !task.status.trim()
+      || (task.failure_reason !== undefined
+          && (task.status !== "failed" || task.failure_reason !== "oom"))
       || task.can_cancel !== false) {
     return false;
   }
@@ -134,7 +136,11 @@ function taskCard(task, outputId) {
   if (queued) status.textContent = `排队中 · 全局队位 ${task.queue_position}`;
   else if (task.status === "admitted") status.textContent = "已获准";
   else if (task.status === "running") status.textContent = "运行中";
-  else status.textContent = "已离开队列";
+  else if (task.status === "completed") status.textContent = "已完成";
+  else if (task.status === "failed") {
+    status.textContent = task.failure_reason === "oom"
+      ? "失败 · GPU 显存不足（OOM）" : "失败 · 模拟执行方未提供具体原因";
+  } else status.textContent = "已离开队列";
   card.append(heading, status);
   if (queued) {
     const reason = document.createElement("p");

@@ -235,6 +235,27 @@ for (const detail of [false, true]) {
     assert.doesNotMatch(page.rows(), /已获准|全局队位|取消任务/);
   });
 
+  for (const [status, failure_reason, label] of [
+    ["completed", undefined, /已完成/],
+    ["failed", "oom", /失败.*显存不足（OOM）/],
+    ["failed", undefined, /失败.*未提供具体原因/],
+  ]) {
+    test(`${view}显示终态 ${failure_reason || status} 并拒绝迟到的运行快照`, async () => {
+      const page = makePage(detail);
+      const running = { status: "running", queue_position: null, waiting_reason: null };
+      page.reply(0, snapshot(detail, "1", running));
+      await settle();
+      const old = page.refresh();
+      const latest = page.refresh();
+      page.reply(2, snapshot(detail, "3", { ...running, status, failure_reason }));
+      await latest;
+      page.reply(1, snapshot(detail, "2", running));
+      await old;
+      assert.match(page.rows(), label);
+      assert.doesNotMatch(page.rows(), /运行中|全局队位/);
+    });
+  }
+
   test(`${view}拒绝缺版本、不可比较版本或不完整的快照`, async () => {
     const shared = makeSharedVersionStore();
     const page = makePage(detail, shared);
@@ -249,6 +270,10 @@ for (const detail of [false, true]) {
       { ...good, snapshot_version: "10\n" },
       snapshot(detail, "10", { waiting_reason: undefined }),
       snapshot(detail, "10", { can_cancel: true }),
+      snapshot(detail, "10", { failure_reason: "oom" }),
+      snapshot(detail, "10", {
+        status: "failed", queue_position: null, waiting_reason: null, failure_reason: 3,
+      }),
       detail ? snapshot(true, "10", { task_id: "98557b23-2905-4cbb-8dfe-e359f51badc8" })
         : { snapshot_version: "10", task },
     ];
