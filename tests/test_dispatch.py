@@ -19,7 +19,9 @@ from test_submissions import (
 )
 
 from labqueue.app import create_app
+from labqueue.auth import Account
 from labqueue.leases import ClaimBlocked, ClaimCommitUnknown, ClaimedLease
+from labqueue.starts import StartBlocked, StartCommitUnknown, StartConfirmed
 from labqueue.submissions import SubmissionStore
 
 
@@ -47,6 +49,330 @@ def owner_task(client, headers, task_id):
     detail = client.get(f"/api/tasks/{task_id}", headers=headers).json()
     assert detail == {"snapshot_version": listing["snapshot_version"], "task": task}
     return int(listing["snapshot_version"]), task
+
+
+@pytest.fixture
+def admitted_start(client):
+    headers = login(client)
+    task = api_submit(client, headers)
+    observation = publish(client, {GPU_1: "idle", GPU_2: "idle"})
+    lease = client.app.state.claim_head()
+    assert isinstance(lease, ClaimedLease)
+    assert (lease.task_id, lease.gpu_uuid) == (task["task_id"], GPU_1)
+    request = dict(task_id=lease.task_id, claim_id=lease.claim_id, gpu_uuid=lease.gpu_uuid)
+    return headers, observation, request
+
+
+def start_state(database):
+    with closing(sqlite3.connect(database, autocommit=True)) as db:
+        db.execute("BEGIN")
+        leases = db.execute("SELECT * FROM gpu_leases ORDER BY acquired_version").fetchall()
+        events = db.execute("SELECT * FROM simulated_start_events ORDER BY task_id").fetchall()
+        tasks = db.execute("SELECT task_id, status FROM tasks ORDER BY enqueue_seq").fetchall()
+        version = db.execute("SELECT snapshot_version FROM queue_state").fetchone()[0]
+    return leases, events, tasks, version
+
+
+@pytest.mark.parametrize("fault", ["committed", "read_unavailable", "not_committed"])
+def test_start_commit_fault_and_replay(client, database, admitted_start, monkeypatch, fault):
+    headers, observation, request = admitted_start
+    executor = Account("demo-a", "group-a")
+    start_time = observation.started_at + 1
+    client.app.state.observations.advance_clock(start_time)
+    before = start_state(database)
+    connect = sqlite3.connect
+    writers, readonly = [], []
+
+    class LostStartReply(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql != "COMMIT":
+                return super().execute(sql, parameters)
+            with closing(connect(database)) as observer:
+                count = observer.execute("SELECT count(*) FROM simulated_start_events").fetchone()
+                assert count == (0,)
+                assert observer.execute("SELECT start_confirmed FROM gpu_leases").fetchone() == (0,)
+            if fault != "not_committed":
+                super().execute(sql, parameters)
+            self.close()
+            error = sqlite3.OperationalError("synthetic lost start reply")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+
+    def faulting_connect(*args, **kwargs):
+        if kwargs.get("uri"):
+            assert args[0].endswith("?mode=ro")
+            readonly.append(args[0])
+            with pytest.raises(sqlite3.ProgrammingError):
+                writers[0].execute("SELECT 1")
+            if fault == "read_unavailable":
+                raise sqlite3.OperationalError("synthetic read failure")
+            return connect(*args, **kwargs)
+        writer = connect(*args, **kwargs, factory=LostStartReply)
+        writers.append(writer)
+        return writer
+
+    start = client.app.state.confirm_start
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", faulting_connect)
+        if fault == "committed":
+            result = start(executor, **request)
+        else:
+            with pytest.raises(StartCommitUnknown):
+                start(executor, **request)
+    assert len(writers) == len(readonly) == 1
+
+    if fault == "not_committed":
+        assert start_state(database) == before
+        return
+
+    expected = StartConfirmed(
+        **request, execution_owner_id="demo-a", started_at=start_time,
+        snapshot_version=before[3] + 1,
+    )
+    if fault == "committed":
+        assert result == expected
+    committed = start_state(database)
+    assert committed[0] == [before[0][0][:7] + (1, "started", 0)]
+    assert committed[1] == [(
+        expected.task_id, expected.claim_id, expected.gpu_uuid, expected.execution_owner_id,
+        expected.started_at, expected.snapshot_version,
+    )]
+    version, task = owner_task(client, headers, expected.task_id)
+    assert version == expected.snapshot_version
+    assert task["status"] == "running"
+    assert task["queue_position"] is None and task["waiting_reason"] is None
+
+    client.app.state.observations.advance_clock(observation.deadline)
+    after_expiry = start_state(database)
+    for _ in range(2):
+        assert start(executor, **request) == expected
+    assert start(Account("demo-a-peer", "group-a"), **request) == StartBlocked("identity_mismatch")
+    assert start_state(database) == after_expiry
+    with closing(connect(database)) as db, db:
+        db.execute("""
+            UPDATE gpu_leases SET reconciliation_pending = 1, execution_evidence = 'unknown'
+            WHERE claim_id = ?
+            """, (expected.claim_id,))
+    pending = start_state(database)
+    assert start(executor, **request) == expected
+    assert start_state(database) == pending
+    with closing(connect(database)) as db, pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        db.execute("INSERT INTO simulated_start_events SELECT * FROM simulated_start_events")
+
+
+@pytest.mark.parametrize(("scenario", "reason"), [
+    ("expired", "observation_blocked"),
+    ("monitor_failed", "observation_blocked"),
+    ("visibility_unknown", "observation_blocked"),
+    ("old_generation", "claim_invalidated"),
+    ("revoked_card", "claim_invalidated"),
+    ("released", "claim_mismatch"),
+    ("cancelled", "task_not_admitted"),
+    ("pending", "reconciliation_pending"),
+    ("unknown", "execution_unverified"),
+    ("started_without_event", "execution_unverified"),
+    ("confirmed_without_event", "execution_unverified"),
+    ("wrong_identity", "identity_mismatch"),
+    ("wrong_claim", "claim_mismatch"),
+    ("wrong_gpu", "claim_mismatch"),
+    ("wrong_task", "claim_mismatch"),
+])
+def test_blocked_start_leaves_committed_state_untouched(
+    client, database, admitted_start, scenario, reason
+):
+    _, observation, request = admitted_start
+    executor = Account("demo-a", "group-a")
+    if scenario in ("expired", "old_generation"):
+        client.app.state.observations.advance_clock(observation.deadline)
+        if scenario == "old_generation":
+            publish(client, {GPU_1: "idle", GPU_2: "idle"})
+    elif scenario == "monitor_failed":
+        publish(client, None)
+    elif scenario == "visibility_unknown":
+        publish(client, {GPU_1: "idle", GPU_2: "unknown"})
+    elif scenario == "revoked_card":
+        publish(client, {GPU_1: "busy", GPU_2: "idle"})
+        publish(client, {GPU_1: "idle", GPU_2: "idle"})
+    elif scenario == "wrong_identity":
+        executor = Account("demo-a-peer", "group-a")
+    elif scenario == "wrong_claim":
+        request["claim_id"] = str(uuid4())
+    elif scenario == "wrong_gpu":
+        request["gpu_uuid"] = GPU_2
+    elif scenario == "wrong_task":
+        request["task_id"] = str(uuid4())
+    else:
+        state_fixture = {
+            "released": "UPDATE gpu_leases SET released_version = acquired_version + 1",
+            "cancelled": "UPDATE tasks SET status = 'cancelled'",
+            "pending": "UPDATE gpu_leases SET reconciliation_pending = 1",
+            "unknown": "UPDATE gpu_leases SET execution_evidence = 'unknown'",
+            "started_without_event": "UPDATE gpu_leases SET execution_evidence = 'started'",
+            "confirmed_without_event": "UPDATE gpu_leases SET start_confirmed = 1",
+        }
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute(state_fixture[scenario])
+
+    before = start_state(database)
+    assert before[1] == []
+    assert client.app.state.confirm_start(executor, **request) == StartBlocked(reason)
+    assert start_state(database) == before
+
+
+def test_start_rolls_back_confirmation_event_and_version_together(client, database, admitted_start):
+    _, _, request = admitted_start
+    with closing(sqlite3.connect(database)) as db, db:
+        db.executescript("""
+            CREATE TRIGGER refuse_running BEFORE UPDATE OF status ON tasks
+            WHEN NEW.status = 'running' BEGIN
+                SELECT RAISE(ABORT, 'synthetic task write failure');
+            END;
+            """)
+    before = start_state(database)
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic task write failure"):
+        client.app.state.confirm_start(Account("demo-a", "group-a"), **request)
+    assert start_state(database) == before
+
+
+def test_start_stops_if_durable_evidence_cannot_be_read(
+    client, database, admitted_start, monkeypatch
+):
+    _, _, request = admitted_start
+    before = start_state(database)
+    connect = SubmissionStore._connect
+
+    def authorize(operation, table, *_):
+        if operation == sqlite3.SQLITE_READ and table == "simulated_start_events":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def connect_without_evidence(store):
+        db = connect(store)
+        db.set_authorizer(authorize)
+        return db
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SubmissionStore, "_connect", connect_without_evidence)
+        with pytest.raises(sqlite3.DatabaseError, match="prohibited"):
+            client.app.state.confirm_start(Account("demo-a", "group-a"), **request)
+    assert start_state(database) == before
+
+
+def test_busy_start_rereads_expiry_after_acquiring_write_lock(
+    client, database, admitted_start, monkeypatch
+):
+    _, observation, request = admitted_start
+    connect = sqlite3.connect
+    writers = []
+    expiring = False
+
+    with closing(connect(database, autocommit=True)) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+
+        class ContendedStart(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                nonlocal expiring
+                try:
+                    return super().execute(sql, parameters)
+                except sqlite3.OperationalError as error:
+                    assert sql == "BEGIN IMMEDIATE"
+                    assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                    blocker.execute("ROLLBACK")
+                    expiring = True
+                    try:
+                        client.app.state.observations.advance_clock(observation.deadline)
+                    finally:
+                        expiring = False
+                    raise
+
+        def connect_with_fault(*args, **kwargs):
+            if expiring:
+                return connect(*args, **kwargs)
+            writer = connect(*args, **(kwargs | {"timeout": 0, "factory": ContendedStart}))
+            writers.append(writer)
+            return writer
+
+        before = start_state(database)
+        with monkeypatch.context() as patch:
+            patch.setattr(sqlite3, "connect", connect_with_fault)
+            result = client.app.state.confirm_start(Account("demo-a", "group-a"), **request)
+
+    failed, retried = writers
+    assert failed is not retried
+    assert result == StartBlocked("observation_blocked")
+    assert start_state(database) == (*before[:3], before[3] + 1)
+
+
+def test_start_checks_clock_at_deadline_even_if_expiry_marker_is_missing(
+    client, database, admitted_start
+):
+    _, observation, request = admitted_start
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("UPDATE gpu_admission_state SET clock = ? WHERE id = 1", (observation.deadline,))
+    admission, version = committed_admission(database)
+    before = start_state(database)
+    assert admission.waiting_reason == "waiting_dispatch"
+
+    result = client.app.state.confirm_start(Account("demo-a", "group-a"), **request)
+
+    expired, expired_version = committed_admission(database)
+    assert result == StartBlocked("observation_blocked")
+    assert expired.waiting_reason == "gpu_observation_expired" and not expired.candidate_uuids
+    assert expired.admission_generation == admission.admission_generation + 1
+    assert expired_version == version + 1
+    assert start_state(database) == (*before[:3], expired_version)
+
+
+def test_story_2_2_database_adds_start_events_without_updating_old_claim(
+    database, admitted_start
+):
+    _, _, request = admitted_start
+    before = start_state(database)
+    with closing(sqlite3.connect(database)) as db, db:
+        db.execute("DROP TABLE simulated_start_events")
+
+    store = SubmissionStore(database)
+    observations = store.initialize()
+    assert observations.publish(observations.begin_collection(), {GPU_1: "idle", GPU_2: "idle"})
+    assert start_state(database)[:3] == before[:3]
+    assert store.confirm_start(Account("demo-a", "group-a"), **request) == StartBlocked(
+        "claim_invalidated"
+    )
+    assert start_state(database)[:3] == before[:3]
+
+
+def test_two_simulated_cards_start_only_their_matching_tasks(client, database):
+    earlier = api_submit(client, login(client))
+    later = api_submit(client, login(client, "demo-b"))
+    publish(client, {GPU_1: "idle", GPU_2: "idle"})
+    claim_one, claim_two = (client.app.state.claim_head() for _ in range(2))
+    assert isinstance(claim_one, ClaimedLease) and isinstance(claim_two, ClaimedLease)
+    assert (claim_one.task_id, claim_one.gpu_uuid) == (earlier["task_id"], GPU_1)
+    assert (claim_two.task_id, claim_two.gpu_uuid) == (later["task_id"], GPU_2)
+    start = client.app.state.confirm_start
+    before = start_state(database)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first, replay, second = (
+            pool.submit(start, account, task_id=claim.task_id,
+                        claim_id=claim.claim_id, gpu_uuid=claim.gpu_uuid)
+            for claim, account in (
+                (claim_one, Account("demo-a", "group-a")),
+                (claim_one, Account("demo-a", "group-a")),
+                (claim_two, Account("demo-b", "group-b")),
+            )
+        )
+        assert isinstance(first.result(), StartConfirmed)
+        assert first.result() == replay.result()
+        assert isinstance(second.result(), StartConfirmed)
+
+    leases, events, tasks, version = start_state(database)
+    assert {(row[0], row[1], row[2]) for row in events} == {
+        (claim_one.task_id, claim_one.claim_id, GPU_1),
+        (claim_two.task_id, claim_two.claim_id, GPU_2),
+    }
+    assert [row[:7] for row in leases] == [row[:7] for row in before[0]]
+    assert tasks == [(claim_one.task_id, "running"), (claim_two.task_id, "running")]
+    assert version == before[3] + 2
 
 
 @pytest.mark.parametrize("lose_reply", [False, True], ids=["acknowledged", "lost_after_commit"])
@@ -164,6 +490,22 @@ def test_single_available_gpu_keeps_global_fifo_with_concurrent_claims(
     assert client.get(receipt_path, headers=headers).json() == earlier
     assert client.post("/api/submissions", json=body, headers=headers).json() == earlier
     assert earlier["memory_gib"] is None
+
+    start = client.app.state.confirm_start
+    identity = Account("demo-a", "group-a")
+    request = dict(task_id=admitted.task_id, claim_id=admitted.claim_id, gpu_uuid=GPU_1)
+    confirmed = start(identity, **request)
+    assert isinstance(confirmed, StartConfirmed)
+    assert start(identity, **request) == confirmed
+    assert start(
+        Account("demo-b", "group-b"), **(request | {"task_id": later["task_id"]})
+    ) == StartBlocked("claim_mismatch")
+    assert claim() == ClaimBlocked("gpu_busy")
+    leases, events, tasks, started_version = start_state(database)
+    assert [lease[:7] for lease in leases] == [row[:7]]
+    assert [event[:3] for event in events] == [(earlier["task_id"], admitted.claim_id, GPU_1)]
+    assert tasks == [(earlier["task_id"], "running"), (later["task_id"], "queued")]
+    assert started_version == admitted.acquired_version + 1
 
 
 @pytest.mark.parametrize(

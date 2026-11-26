@@ -202,7 +202,7 @@ def _expire(state: AdmissionState) -> AdmissionState:
     return state
 
 
-def read_admission_for_claim(db: sqlite3.Connection) -> AdmissionState:
+def read_admission_for_dispatch(db: sqlite3.Connection) -> AdmissionState:
     """持有写权时复核时效，必要时同事务封闭旧代际。"""
     before = read_admission(db)
     current = _expire(before)

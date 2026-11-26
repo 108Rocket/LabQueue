@@ -106,6 +106,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
             raise RuntimeError("检测到旧任务库，请先停服并将 SQLite 备份迁入账号私有目录")
         app.state.observations = store.initialize()
         app.state.claim_head = store.claim_head
+        app.state.confirm_start = store.confirm_start
         app.state.sessions = DemoSessions()
         yield
 

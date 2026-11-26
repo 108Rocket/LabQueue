@@ -217,6 +217,24 @@ for (const detail of [false, true]) {
     assert.equal(page.feedback(), "已更新任务。");
   });
 
+  test(`${view}显示运行中并拒绝迟到的已获准快照`, async () => {
+    const page = makePage(detail);
+    page.reply(0, snapshot(detail, "1"));
+    await settle();
+    const admitted = page.refresh();
+    const running = page.refresh();
+    page.reply(2, snapshot(detail, "3", {
+      status: "running", queue_position: null, waiting_reason: null,
+    }));
+    await running;
+    page.reply(1, snapshot(detail, "2", {
+      status: "admitted", queue_position: null, waiting_reason: null,
+    }));
+    await admitted;
+    assert.match(page.rows(), /运行中/);
+    assert.doesNotMatch(page.rows(), /已获准|全局队位|取消任务/);
+  });
+
   test(`${view}拒绝缺版本、不可比较版本或不完整的快照`, async () => {
     const shared = makeSharedVersionStore();
     const page = makePage(detail, shared);
