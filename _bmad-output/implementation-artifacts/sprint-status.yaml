@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-22-2026 10:31
-last_updated: 11-26-2026 20:39
+last_updated: 11-26-2026 23:31
 project: LabQueue
 project_key: NOKEY
 tracking_system: file-system
@@ -50,7 +50,7 @@ development_status:
 
   epic-3: in-progress
   3-1-取消尚未领取的排队任务: done
-  3-2-裁决已领取任务的取消与启动竞争: review
+  3-2-裁决已领取任务的取消与启动竞争: done
   3-3-启动事实未知时保留原卡-证据恢复后按事实裁决: backlog
   epic-3-retrospective: optional
 

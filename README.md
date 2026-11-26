@@ -14,6 +14,8 @@ $env:LABQUEUE_DEMO_B_PASSWORD = Read-Host '为 demo-b 设置本地模拟密码'
 .\scripts\dev.ps1
 ```
 
+本地双卡模拟请只运行一个服务工作进程，并让 HTTP 取消、取消恢复、启动确认和派发入口共享应用创建的同一个 `SubmissionStore`。取消阻断记录写入失败时，这些入口依靠该实例的锁及关闭标记阻止新增启动和租约。另建 store（即使连接同一 SQLite 文件）或启用多个工作进程时，此保证不适用。
+
 访问 <http://127.0.0.1:8000>，API 文档在 <http://127.0.0.1:8000/docs>。关闭终端中的服务按 `Ctrl+C`。
 
 登录后可用任务名和合成命令（例如 `echo synthetic-job`）提交，显存选择「未知」即可。任务保存在运行账号的私有目录，Windows 使用 `%LOCALAPPDATA%\LabQueue\labqueue.sqlite3`，Linux 使用 `~/.local/share/labqueue/labqueue.sqlite3`。服务重启后重新登录，可用原提交键核对回执。
