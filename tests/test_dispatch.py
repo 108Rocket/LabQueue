@@ -1,6 +1,7 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from dataclasses import replace
 from threading import Event
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from test_submissions import (
 from labqueue.app import create_app
 from labqueue.auth import Account
 from labqueue.leases import ClaimBlocked, ClaimCommitUnknown, ClaimedLease
+from labqueue.results import EndBlocked, EndCommitUnknown, EndConfirmed, EndReport
 from labqueue.starts import StartBlocked, StartCommitUnknown, StartConfirmed
 from labqueue.submissions import SubmissionStore
 
@@ -373,6 +375,13 @@ def test_two_simulated_cards_start_only_their_matching_tasks(client, database):
     assert [row[:7] for row in leases] == [row[:7] for row in before[0]]
     assert tasks == [(claim_one.task_id, "running"), (claim_two.task_id, "running")]
     assert version == before[3] + 2
+
+    report = EndReport(claim_one.task_id, claim_one.claim_id, GPU_1, "completed", True, True)
+    ended = client.app.state.report_end(Account("demo-a", "group-a"), report)
+    assert isinstance(ended, EndConfirmed)
+    remaining, same_starts, after_tasks, _ = start_state(database)
+    assert remaining[1] == leases[1] and same_starts == events
+    assert after_tasks == [(claim_one.task_id, "completed"), (claim_two.task_id, "running")]
 
 
 @pytest.mark.parametrize("lose_reply", [False, True], ids=["acknowledged", "lost_after_commit"])
@@ -898,3 +907,184 @@ def test_history_preserves_disjoint_intervals_and_unique_current_leases(client, 
     previous, current = history(database)
     assert previous[4:6] == (first.acquired_version, released)
     assert current[4:6] == (released + 1, None)
+
+
+def end_state(db, task_id):
+    return db.execute("""
+        SELECT t.status, r.outcome, l.released_version, q.snapshot_version,
+               (SELECT count(*) FROM simulated_start_events s WHERE s.task_id=t.task_id),
+               t.name, t.command, t.memory_gib
+        FROM tasks t JOIN gpu_leases l USING (task_id)
+        LEFT JOIN simulated_results r USING (task_id) CROSS JOIN queue_state q
+        WHERE t.task_id = ?
+        """, (task_id,)).fetchone()
+
+
+@pytest.mark.parametrize("outcome", ["completed", "oom", "failed"])
+def test_end_is_atomic_and_original_gpu_handoff(client, database, monkeypatch, outcome):
+    owner = Account("demo-a", "group-a")
+    headers = login(client)
+    task = api_submit(client, headers, command="simulate --batch 64", memory_gib="7")
+    task_id = task["task_id"]
+    publish(client, {GPU_1: "idle", GPU_2: "busy"})
+    lease = client.app.state.claim_head()
+    assert isinstance(lease, ClaimedLease) and lease.gpu_uuid == GPU_1
+    args = dict(task_id=task_id, claim_id=lease.claim_id, gpu_uuid=GPU_1)
+    assert isinstance(client.app.state.confirm_start(owner, **args), StartConfirmed)
+    _, running = owner_task(client, headers, task_id)
+    assert running["status"] == "running"
+    next_task = api_submit(client, login(client, "demo-b"))
+    headers = login(client)
+    assert client.app.state.claim_head() == ClaimBlocked("gpu_busy")
+    report = EndReport(**args, outcome=outcome, execution_ended=True, gpu_use_ended=True)
+    finish = client.app.state.report_end
+    connect = sqlite3.connect
+    before_commit = []
+
+    class ObserveCommit(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == "COMMIT":
+                with closing(connect(database)) as observer:
+                    before_commit.append(end_state(observer, task_id))
+            return super().execute(sql, parameters)
+
+    with closing(connect(database)) as observer:
+        before = end_state(observer, task_id)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                sqlite3, "connect", lambda *a, **kw: connect(*a, **kw, factory=ObserveCommit)
+            )
+            result = finish(owner, report)
+        assert before_commit == [before]
+        assert before[:3] == ("running", None, None)
+        after = end_state(observer, task_id)
+        status = "completed" if outcome == "completed" else "failed"
+        assert after == (status, outcome, before[3] + 1, before[3] + 1, 1, *before[5:])
+        assert after[5:] == ("合成任务", "simulate --batch 64", "7")
+        assert result == EndConfirmed(**args, outcome=outcome, released_version=after[2])
+        assert finish(owner, report) == result
+        assert end_state(observer, task_id) == after
+    version, visible = owner_task(client, headers, task_id)
+    assert (version, visible["status"]) == (after[2], status)
+    assert visible.get("failure_reason") == ("oom" if outcome == "oom" else None)
+    assert client.delete("/api/session", headers=headers).status_code == 204
+    assert client.get(f"/api/tasks/{task_id}").status_code == 401
+    for other in ("demo-a-peer", "demo-b"):
+        other_headers = login(client, other)
+        assert client.get(f"/api/tasks/{task_id}", headers=other_headers).status_code == 404
+        visible_tasks = client.get("/api/tasks", headers=other_headers).json()["tasks"]
+        assert all(t["task_id"] != task_id for t in visible_tasks)
+
+    publish(client, {GPU_1: "busy", GPU_2: "busy"})
+    assert client.app.state.claim_head() == ClaimBlocked("gpu_busy")
+    publish(client, {GPU_1: "idle", GPU_2: "busy"})
+    next_lease = client.app.state.claim_head()
+    assert (next_lease.task_id, next_lease.gpu_uuid) == (next_task["task_id"], GPU_1)
+    intervals = history(database)
+    assert len(intervals) == 2
+    assert intervals[0][5] == result.released_version < next_lease.acquired_version
+    assert intervals[1][5] is None
+    assert finish(owner, report) == result
+    assert history(database) == intervals
+    if outcome == "oom":
+        with TestClient(create_app(database), base_url=BASE_URL) as restarted:
+            assert restarted.app.state.report_end(owner, report) == result
+            _, saved = owner_task(restarted, login(restarted), task_id)
+            assert (saved["status"], saved["failure_reason"]) == ("failed", "oom")
+            assert history(database) == intervals
+
+
+@pytest.mark.parametrize("change", [
+    "no_start", "wrong_claim", "wrong_gpu", "wrong_task", "wrong_owner", "still_running",
+    "can_use_gpu", "unknown_result", "missing_start_event",
+])
+def test_unverified_end_preserves_original_gpu(client, database, admitted_start, change):
+    _, _, args = admitted_start
+    owner = Account("demo-a", "group-a")
+    if change != "no_start":
+        assert isinstance(client.app.state.confirm_start(owner, **args), StartConfirmed)
+    report = EndReport(**args, outcome="completed", execution_ended=True, gpu_use_ended=True)
+    if change == "missing_start_event":
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("DELETE FROM simulated_start_events")
+    changes = {
+        "wrong_claim": dict(claim_id=str(uuid4())), "wrong_gpu": dict(gpu_uuid=GPU_2),
+        "wrong_task": dict(task_id=str(uuid4())), "still_running": dict(execution_ended=False),
+        "can_use_gpu": dict(gpu_use_ended=False), "unknown_result": dict(outcome="unknown"),
+    }
+    if change == "wrong_owner":
+        owner = Account("demo-a-peer", "group-a")
+    before = start_state(database)
+    result = client.app.state.report_end(owner, replace(report, **changes.get(change, {})))
+    assert isinstance(result, EndBlocked)
+    assert start_state(database) == before
+    with closing(sqlite3.connect(database)) as db:
+        assert db.execute("SELECT count(*) FROM simulated_results").fetchone() == (0,)
+
+
+@pytest.mark.parametrize(("committed", "read_error"), [(False, False), (True, False), (True, True)])
+def test_lost_end_reply_reconciles_without_releasing_again(
+    client, database, admitted_start, monkeypatch, committed, read_error
+):
+    _, _, args = admitted_start
+    owner = Account("demo-a", "group-a")
+    client.app.state.confirm_start(owner, **args)
+    report = EndReport(**args, outcome="oom", execution_ended=True, gpu_use_ended=True)
+    finish = client.app.state.report_end
+    connect = sqlite3.connect
+    writes = []
+
+    class LostEndReply(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql != "COMMIT":
+                return super().execute(sql, parameters)
+            if committed:
+                super().execute(sql)
+            self.close()
+            raise sqlite3.OperationalError("synthetic lost reply")
+
+    def faulting_connect(*args, **kwargs):
+        if kwargs.get("uri"):
+            assert args[0].endswith("?mode=ro")
+            if read_error:
+                raise sqlite3.OperationalError("synthetic unavailable snapshot")
+            return connect(*args, **kwargs)
+        writes.append(1)
+        return connect(*args, **kwargs, factory=LostEndReply)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", faulting_connect)
+        if committed and not read_error:
+            original = finish(owner, report)
+            assert isinstance(original, EndConfirmed)
+        else:
+            with pytest.raises(EndCommitUnknown):
+                finish(owner, report)
+    assert writes == [1]
+    if not committed:
+        with closing(connect(database)) as db:
+            assert end_state(db, report.task_id)[:3] == ("running", None, None)
+    with ThreadPoolExecutor(2) as pool:
+        first, replay = pool.map(lambda _: finish(owner, report), range(2))
+    assert isinstance(first, EndConfirmed) and first == replay
+    assert finish(owner, replace(report, outcome="completed")) == EndBlocked("conflict")
+    with closing(connect(database)) as db:
+        assert end_state(db, report.task_id)[:5] == (
+            "failed", "oom", first.released_version, first.released_version, 1,
+        )
+
+
+def test_release_write_failure_rolls_back_terminal_result(client, database, admitted_start):
+    _, _, args = admitted_start
+    owner = Account("demo-a", "group-a")
+    client.app.state.confirm_start(owner, **args)
+    report = EndReport(**args, outcome="completed", execution_ended=True, gpu_use_ended=True)
+    with closing(sqlite3.connect(database)) as observer:
+        before = end_state(observer, report.task_id)
+        observer.execute("""
+            CREATE TRIGGER refuse_release BEFORE UPDATE OF released_version ON gpu_leases
+            BEGIN SELECT RAISE(ABORT, 'synthetic release failure'); END
+            """)
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic release failure"):
+            client.app.state.report_end(owner, report)
+        assert end_state(observer, report.task_id) == before

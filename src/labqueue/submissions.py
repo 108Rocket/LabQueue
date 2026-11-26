@@ -28,6 +28,15 @@ from labqueue.observations import (
     read_admission,
     read_admission_for_dispatch,
 )
+from labqueue.results import (
+    EndBlocked,
+    EndCommitUnknown,
+    EndConfirmed,
+    EndReport,
+    decide_end,
+    initialize_results,
+    read_result,
+)
 from labqueue.starts import (
     StartCommitUnknown,
     StartConfirmed,
@@ -73,6 +82,7 @@ class TaskView(BaseModel):
     status: str
     queue_position: int | None
     waiting_reason: WaitingReason | Literal["requeue_required"] | None
+    failure_reason: Literal["oom"] | None = Field(default=None, exclude_if=lambda v: v is None)
     can_cancel: Literal[False] = False
 
 
@@ -175,6 +185,7 @@ class SubmissionStore:
                 """)
             initialize_leases(db)
             initialize_starts(db)
+            initialize_results(db)
             publisher = SimulatedObservations(
                 self._connect, self._connect_readonly, *initialize_observations(db)
             )
@@ -270,6 +281,42 @@ class SubmissionStore:
                 return committed
         raise StartCommitUnknown("无法证实模拟启动已提交") from commit_error
 
+    def report_end(self, executor: Account, report: EndReport) -> EndConfirmed | EndBlocked:
+        """由受信任的本地模拟执行方报告结束证据。"""
+        try:
+            return self._report_end(executor, report)
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_BUSY:
+                raise
+            return self._report_end(executor, report)
+
+    def _report_end(self, executor: Account, report: EndReport) -> EndConfirmed | EndBlocked:
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                result = decide_end(db, executor, report)
+            except BaseException:
+                rollback_open_transaction(db)
+                raise
+            try:
+                db.execute("COMMIT")
+            except sqlite3.Error as error:
+                if rollback_open_transaction(db):
+                    raise
+                commit_error = error
+            else:
+                return result
+
+        if isinstance(result, EndConfirmed):
+            try:
+                with closing(self._connect_readonly()) as db:
+                    committed = read_result(db, report.task_id)
+            except (sqlite3.Error, OSError) as error:
+                raise EndCommitUnknown("无法读取模拟终态") from error
+            if committed == result:
+                return result
+        raise EndCommitUnknown("无法证实模拟终态已提交") from commit_error
+
     def list_tasks(self, account: Account) -> TaskListSnapshot:
         version, tasks, _ = self._task_snapshot(account, task_id=None)
         return TaskListSnapshot(snapshot_version=version, tasks=tasks)
@@ -322,21 +369,23 @@ class SubmissionStore:
                            FROM tasks WHERE status = 'queued'
                        )
                        SELECT t.task_id, t.name, t.enqueue_seq, t.queued_at, t.status,
-                              ranked.queue_position
+                              ranked.queue_position, r.outcome
                        FROM tasks AS t LEFT JOIN ranked ON ranked.task_id = t.task_id
+                       LEFT JOIN simulated_results r ON r.task_id = t.task_id
                        WHERE t.owner_id = ? ORDER BY t.enqueue_seq""",
                     (account.owner_id,),
                 ).fetchall()
             elif self.owns_task(db, account, task_id):
                 rows = db.execute(
                     """SELECT t.task_id, t.name, t.enqueue_seq, t.queued_at, t.status,
-                              output.output_id,
+                              output.output_id, r.outcome,
                               CASE WHEN t.status = 'queued' THEN (
                                   SELECT count(*) + 1 FROM tasks AS earlier
                                   WHERE earlier.status = 'queued'
                                     AND earlier.enqueue_seq < t.enqueue_seq
                               ) END AS queue_position
                        FROM tasks AS t LEFT JOIN task_outputs AS output USING (task_id)
+                       LEFT JOIN simulated_results r USING (task_id)
                        WHERE t.task_id = ?""",
                     (task_id,),
                 ).fetchall()
@@ -350,6 +399,7 @@ class SubmissionStore:
                 enqueue_seq=str(row["enqueue_seq"]),
                 queued_at=row["queued_at"],
                 status=row["status"],
+                failure_reason="oom" if row["outcome"] == "oom" else None,
                 queue_position=row["queue_position"],
                 waiting_reason=reason if row["status"] == "queued" else None,
             )
