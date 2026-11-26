@@ -178,8 +178,7 @@ def _transition(
 def _advance_once(
     store: "SubmissionStore", account: Account, task_id: str, request_id: str, action: Action
 ) -> CancellationReceipt | None:
-    with closing(store._connect()) as db:
-        db.execute("BEGIN IMMEDIATE")
+    with store.execution_writer() as db:
         if not store.owns_task(db, account, task_id):
             return None
         fact = cancellation_fact(db, account.owner_id, task_id, request_id)
@@ -188,7 +187,7 @@ def _advance_once(
             try:
                 _transition(db, account, task_id, fact, action)
             except sqlite3.Error as error:
-                # 仍持有写锁：先撤回裁决的全部局部写入，再持久隔离该原 ID。
+                # 实例锁覆盖整个隔离过程，包括 SQLite 提前释放写权后的异常处理。
                 try:
                     db.execute("ROLLBACK TO cancel_decision")
                     inserted = db.execute("""

@@ -1102,3 +1102,106 @@ def test_recovery_block_commit_failure_stays_closed_until_restart(database, monk
         assert resolved["gpu_leases"][0][5] == resolved["cancellation_requests"][0][5]
         assert client.post(command(task, key), headers=headers).json()["state"] == "cancelled"
         assert history(database) == resolved
+
+
+@pytest.mark.parametrize("fault", ["close_on_commit", "rollback_on_insert"])
+def test_execution_entries_during_unreported_block_failure(database, monkeypatch, fault):
+    """数据库已释放写权，阻断写异常仍停在驱动层时，两个执行入口同时到达。"""
+    from labqueue.leases import ClaimBlocked
+    from labqueue.starts import StartBlocked
+
+    owner = Account("demo-a", "group-a")
+    key = str(uuid4())
+    database_unlocked, propagate, acquired_writer = Event(), Event(), Event()
+    at_begin = {name: Event() for name in ("start", "claim")}
+    caller = local()
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        headers = login(client)
+        a, b = [api_submit(client, headers)["task_id"] for _ in range(2)]
+        publish(client, {GPU_1: "idle", GPU_2: "idle"})
+        lease = client.app.state.claim_head()
+        args = dict(task_id=a, claim_id=lease.claim_id, gpu_uuid=lease.gpu_uuid)
+        store = client.app.state.confirm_start.__self__
+        cancellations._advance(store, owner, a, key, "accept")
+        before = history(database)
+        connect = store._connect
+
+        if fault == "rollback_on_insert":
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("""CREATE TRIGGER rollback_block
+                              BEFORE INSERT ON cancellation_recovery_blocks
+                              BEGIN SELECT RAISE(ROLLBACK, 'injected rollback'); END""")
+
+        class PauseFault:
+            def __init__(self, db):
+                self.db = db
+                self.inserting_block = False
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+            def execute(self, sql, parameters=()):
+                action = getattr(caller, "action", None)
+                if sql == "BEGIN IMMEDIATE" and action in at_begin:
+                    at_begin[action].set()
+                    cursor = self.db.execute(sql, parameters)
+                    acquired_writer.set()
+                    return cursor
+                if "INSERT OR IGNORE INTO cancellation_recovery_blocks" in sql:
+                    self.inserting_block = True
+                    if fault == "rollback_on_insert":
+                        try:
+                            return self.db.execute(sql, parameters)
+                        except sqlite3.IntegrityError:
+                            assert not self.db.in_transaction
+                            database_unlocked.set()
+                            assert propagate.wait(10)
+                            raise
+                if self.inserting_block and fault == "close_on_commit" and sql == "COMMIT":
+                    self.db.close()
+                    database_unlocked.set()
+                    assert propagate.wait(10)
+                    raise sqlite3.OperationalError("injected close")
+                return self.db.execute(sql, parameters)
+
+        def unavailable(db, task_id):
+            raise sqlite3.OperationalError("injected evidence failure")
+
+        def compete(action):
+            caller.action = action
+            if action == "start":
+                return client.app.state.confirm_start(owner, **args)
+            return client.app.state.claim_head()
+
+        with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=3) as workers:
+            patch.setattr(store, "_connect", lambda: PauseFault(connect()))
+            patch.setattr(cancellations, "read_start", unavailable)
+            recovery = workers.submit(cancellations.recover_cancellations, store)
+            try:
+                assert database_unlocked.wait(10)
+                contenders = {name: workers.submit(compete, name) for name in at_begin}
+                assert all(event.wait(10) for event in at_begin.values())
+                assert acquired_writer.wait(10)
+                assert not store.cancellation_storage_failed
+                assert history(database) == before
+            finally:
+                propagate.set()
+            with pytest.raises(sqlite3.Error, match="injected"):
+                recovery.result(10)
+            assert contenders["start"].result(10) == StartBlocked("execution_unverified")
+            assert contenders["claim"].result(10) == ClaimBlocked("gpu_visibility_unknown")
+        assert store.cancellation_storage_failed
+        assert compete("start") == StartBlocked("execution_unverified")
+        assert compete("claim") == ClaimBlocked("gpu_visibility_unknown")
+        assert history(database) == before
+
+    # 故障解除后用原库重新启动；初始化先恢复原 ID，再开放模拟派发。
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        headers = login(client)
+        fact = client.get(f"/api/tasks/{a}?request_id={key}", headers=headers).json()["task"]
+        assert fact["cancellation"] == {"request_id": key, "state": "cancelled"}
+        recovered = history(database)
+        assert recovered["simulated_start_events"] == []
+        assert recovered["gpu_leases"][0][5] == recovered["cancellation_requests"][0][5]
+        publish(client, {GPU_1: "idle", GPU_2: "idle"})
+        assert client.app.state.claim_head().task_id == b

@@ -2,10 +2,12 @@
 
 import json
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -120,7 +122,17 @@ class CommitUncertain(Exception):
 class SubmissionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._execution_lock = Lock()
         self.cancellation_storage_failed = False
+
+    @contextmanager
+    def execution_writer(self) -> Iterator[sqlite3.Connection]:
+        """SQLite 写权在先，实例锁在后。持锁区间内不重新申请数据库写权。"""
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            # SQLite 自动回滚或连接关闭也不会提前解除这把锁。
+            with self._execution_lock:
+                yield db
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=LOCK_WAIT_SECONDS, autocommit=True)
@@ -213,8 +225,7 @@ class SubmissionStore:
 
     def _claim_head(self) -> ClaimResult:
         result: ClaimResult
-        with closing(self._connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.execution_writer() as db:
             if self.cancellation_storage_failed:
                 return ClaimBlocked("gpu_visibility_unknown")
             try:
@@ -266,8 +277,7 @@ class SubmissionStore:
     def _confirm_start(
         self, executor: Account, task_id: str, claim_id: str, gpu_uuid: str
     ) -> StartResult:
-        with closing(self._connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.execution_writer() as db:
             if self.cancellation_storage_failed:
                 return StartBlocked("execution_unverified")
             try:
