@@ -720,12 +720,14 @@ for (const detail of [false, true]) {
   }
 }
 
-test("跨页核对未知、主动封存、完整快照恢复入口，旧回执不能替换新请求", async () => {
+for (const status of ["queued", "admitted"]) {
+test(`${status} 跨页核对未知、主动封存、完整快照恢复入口，旧回执不能替换新请求`, async () => {
   const shared = makeSharedVersionStore();
   const detail = makePage(true, shared);
   const list = makePage(false, shared);
   const queued = (view, version, fact) => snapshot(view, version, {
-    can_cancel: true, ...(fact && { cancellation: fact }),
+    can_cancel: true, ...(status === "admitted"
+      ? { status, queue_position: null, waiting_reason: null } : {}), ...(fact && { cancellation: fact }),
   });
   detail.reply(0, queued(true, "3"));
   list.reply(0, queued(false, "3"));
@@ -767,7 +769,7 @@ test("跨页核对未知、主动封存、完整快照恢复入口，旧回执�
   await settle();
   assert.equal(shared.values.get(versionKey), "4");
   assert.equal(reopened.button("取消任务"), undefined);
-  assert.match(reopened.rows(), /全局队位 2/);
+  assert.match(reopened.rows(), status === "admitted" ? /已获准/ : /全局队位 2/);
   reopened.reply(2, queued(true, "4", fact("sealed")));
   await seal;
   reopened.confirmWith((message) => { assert.ok(message.includes(task.name)); return false; });
@@ -781,7 +783,7 @@ test("跨页核对未知、主动封存、完整快照恢复入口，旧回执�
   assert.notEqual(nextId, id);
   old.reply(receipt("80", "sealed"));
   await oldCommand;
-  assert.equal(shared.values.get(versionKey), "4");
+  assert.equal(shared.values.get(versionKey), "80");
   assert.equal(detail.fetches.length, 2);
   assert.ok(reopened.button("取消任务").disabled);
   reopened.fetches[3].interrupt();
@@ -791,10 +793,28 @@ test("跨页核对未知、主动封存、完整快照恢复入口，旧回执�
   const reconcile = reopened.refresh();
   assert.equal(reopened.fetches[4].method, "GET");
   assert.match(reopened.fetches[4].path, new RegExp(nextId));
-  reopened.reply(4, queued(true, "4", { request_id: nextId, state: "unknown" }));
+  reopened.reply(4, queued(true, "79", { request_id: nextId, state: "processing" }));
   await reconcile;
-  assert.equal(reopened.button("取消任务"), undefined);
+  assert.ok(reopened.button("取消任务").disabled);
+  assert.match(reopened.feedback(), /上次确认/);
+  for (const [page, view] of [[reopened, true], [list, false]]) {
+    const before = page.rows();
+    const stale = page.refresh();
+    page.reply(page.fetches.length - 1,
+      queued(view, "79", { request_id: nextId, state: "processing" }));
+    await stale;
+    assert.equal(page.rows(), before);
+    assert.match(page.feedback(), /上次确认/);
+    const refresh = page.refresh();
+    page.reply(page.fetches.length - 1,
+      queued(view, "80", { request_id: nextId, state: "processing" }));
+    await refresh;
+    assert.match(page.rows(), /正在处理/);
+    assert.equal(page.button("取消任务"), undefined);
+    assert.equal(JSON.parse(shared.values.get("labqueue.cancel-requests.test-session"))[taskId], nextId);
+  }
 });
+}
 
 test("取消回执提高共享版本下限，列表和详情仅从完整快照显示已取消", async () => {
   const shared = makeSharedVersionStore();
@@ -884,5 +904,185 @@ test("只从匹配的终态完整快照清除已封存或已终结的跟踪", as
         ["unknown", "processing"].includes(state) ? request_id : undefined);
       assert.equal(page.button("取消任务"), undefined);
     }
+  }
+});
+
+for (const detail of [false, true]) {
+  const view = detail ? "详情" : "列表";
+  const admitted = { status: "admitted", can_cancel: true,
+    queue_position: null, waiting_reason: null };
+  const cancelled = { status: "cancelled", can_cancel: false,
+    queue_position: null, waiting_reason: null };
+  const otherTask = { ...task, task_id: "0bd4e56f-5f82-4ff6-a75d-d24fe13c8a59", name: "另一任务" };
+  const complete = (version, changes) => {
+    const data = snapshot(detail, version, changes);
+    if (!detail) data.tasks.push(otherTask);
+    return data;
+  };
+
+  test(`${view} A4-A5 已领取未知请求重开和封存均只从完整快照恢复`, async () => {
+    const shared = makeSharedVersionStore();
+    const pendingKey = "labqueue.cancel-requests.test-session";
+    const id = "58d3dc13-67b6-427b-81fb-524090a6f733";
+    shared.values.set(pendingKey, JSON.stringify({ [taskId]: id }));
+    const page = makePage(detail, shared);
+    const fact = (state) => ({ request_id: id, state });
+    page.reply(0, complete("3", { ...admitted, cancellation: fact("unknown") }));
+    await settle();
+    assert.match(page.rows(), /已获准.*\n.*确认时间/s);
+    assert.match(page.rows(), /取消结果未知/);
+    assert.equal(page.button("取消任务"), undefined);
+    const refresh = page.refresh();
+    page.reply(1, complete("3", { ...admitted, cancellation: fact("unknown") }));
+    await refresh;
+    const reopened = makePage(detail, shared);
+    reopened.reply(0, complete("3", { ...admitted, cancellation: fact("unknown") }));
+    await settle();
+    assert.ok(page.fetches.every((r) => r.method === "GET"));
+    assert.ok(reopened.fetches.every((r) => r.method === "GET"));
+    // 列表只导航，封存命令仍由详情页发出。
+    const commandPage = detail ? reopened : makePage(true, shared);
+    if (!detail) {
+      commandPage.reply(0, snapshot(true, "3", { ...admitted, cancellation: fact("unknown") }));
+      await settle();
+    }
+    const before = page.rows();
+    const seal = commandPage.button("核对并封存旧取消请求").fire("click");
+    await settle();
+    commandPage.reply(1, { task_id: taskId, snapshot_version: "4", ...fact("sealed") });
+    await settle();
+    assert.equal(page.rows(), before);
+    assert.equal(commandPage.button("取消任务"), undefined);
+    commandPage.reply(2, snapshot(true, "4", { ...admitted, cancellation: fact("sealed") }));
+    await seal;
+    assert.ok(!commandPage.button("取消任务").disabled);
+    const refreshed = page.refresh();
+    page.reply(2, complete("4", { ...admitted, cancellation: fact("sealed") }));
+    await refreshed;
+    assert.match(page.rows(), /已获准/);
+    if (!detail) assert.match(page.rows(), /另一任务/);
+  });
+
+  test(`${view} A10-A11 取消完整快照先到，跨页旧响应和局部回执不能清行或回退`, async () => {
+    const shared = makeSharedVersionStore();
+    const page = makePage(detail, shared);
+    page.reply(0, complete("2", admitted));
+    await settle();
+    const old = page.refresh();
+    const commandPage = makePage(true, shared);
+    commandPage.reply(0, snapshot(true, "2", admitted));
+    await settle();
+    const action = commandPage.button("取消任务").fire("click");
+    await settle();
+    const request_id = commandPage.fetches[1].path.split("/").at(-1);
+    const cancellation = { request_id, state: "cancelled" };
+    const fresh = page.refresh();
+    page.reply(2, complete("4", { ...cancelled, cancellation }));
+    await fresh;
+    const before = page.rows();
+    assert.match(before, /已取消/);
+    assert.doesNotMatch(before, /已获准|取消任务/);
+    if (!detail) assert.match(before, /另一任务/);
+    // 完整终态快照已清除待核对 ID；迟到回执不得替换画面或新增请求。
+    commandPage.reply(1, { task_id: taskId, snapshot_version: "4", ...cancellation });
+    await action;
+    page.reply(1, complete("2", admitted));
+    await old;
+    assert.equal(page.rows(), before);
+    assert.equal(commandPage.fetches.length, 2);
+    assert.equal(shared.values.get(versionKey), "4");
+  });
+
+  test(`${view} 已过截止点反馈拒绝非法原因、缺字段、错 ID 及旧处理中响应`, async () => {
+    const shared = makeSharedVersionStore();
+    const id = "58d3dc13-67b6-427b-81fb-524090a6f733";
+    shared.values.set("labqueue.cancel-requests.test-session", JSON.stringify({ [taskId]: id }));
+    const page = makePage(detail, shared);
+    const cancellation = { request_id: id, state: "ineligible", reason: "past_cutoff" };
+    const running = { status: "running", can_cancel: false, queue_position: null, waiting_reason: null };
+    page.reply(0, complete("7", { ...running, cancellation }));
+    await settle();
+    assert.match(page.rows(), /已过取消截止点/);
+    const before = page.rows();
+    for (const changes of [
+      { cancellation: { ...cancellation, reason: "invented" } },
+      { cancellation: { ...cancellation, state: "processing" } },
+      { cancellation: { ...cancellation, request_id: otherTask.task_id } },
+      { can_cancel: undefined },
+      { can_cancel: true },
+    ]) {
+      const reading = page.refresh();
+      page.reply(page.fetches.length - 1, complete(changes.cancellation?.request_id === otherTask.task_id ? "7" : "8",
+        { ...running, cancellation, ...changes }));
+      await reading;
+      assert.equal(page.rows(), before);
+      assert.equal(shared.values.get(versionKey), "7");
+      assert.match(page.feedback(), changes.cancellation?.request_id === otherTask.task_id
+        ? /取消请求已变化/ : /暂时无法读取任务/);
+      assert.equal(page.button("取消任务"), undefined);
+    }
+    const old = page.refresh();
+    page.reply(page.fetches.length - 1, complete("6", { ...admitted,
+      cancellation: { request_id: id, state: "processing" } }));
+    await old;
+    assert.equal(page.rows(), before);
+  });
+}
+
+for (const detail of [false, true]) {
+  test(`${detail ? "详情" : "列表"} A11 局部回执先到保留完整画面和其他任务`, async () => {
+    const shared = makeSharedVersionStore();
+    const admitted = { status: "admitted", can_cancel: true,
+      queue_position: null, waiting_reason: null };
+    const page = makePage(detail, shared);
+    const full = snapshot(detail, "2", admitted);
+    if (!detail) full.tasks.push({ ...task,
+      task_id: "0bd4e56f-5f82-4ff6-a75d-d24fe13c8a59", name: "保留的另一任务" });
+    page.reply(0, full);
+    await settle();
+    const before = page.rows();
+    const commandPage = detail ? page : makePage(true, shared);
+    if (!detail) {
+      commandPage.reply(0, snapshot(true, "2", admitted));
+      await settle();
+    }
+    const click = commandPage.button("取消任务").fire("click");
+    await settle();
+    const request_id = commandPage.fetches[1].path.split("/").at(-1);
+    const cancellation = { request_id, state: "cancelled" };
+    commandPage.reply(1, { task_id: taskId, snapshot_version: "4", ...cancellation });
+    await settle();
+    await page.fire("storage", { key: versionKey });
+    assert.equal(page.rows(), before);
+    assert.match(page.feedback(), /上次确认/);
+    if (detail) assert.ok(page.button("取消任务").disabled);
+    else assert.match(page.rows(), /保留的另一任务/);
+    commandPage.reply(2, snapshot(true, "4", { status: "cancelled", can_cancel: false,
+      queue_position: null, waiting_reason: null, cancellation }));
+    await click;
+    if (detail) assert.match(page.rows(), /已取消/);
+    else assert.equal(page.rows(), before);
+  });
+}
+
+
+test("非法原因的取消命令回执不提高版本或触发完整核对", async () => {
+  for (const reason of ["invented", "past_cutoff"]) {
+    const shared = makeSharedVersionStore();
+    const page = makePage(true, shared);
+    page.reply(0, snapshot(true, "2", { status: "admitted", can_cancel: true,
+      queue_position: null, waiting_reason: null }));
+    await settle();
+    const before = page.rows();
+    const click = page.button("取消任务").fire("click");
+    await settle();
+    const request_id = page.fetches[1].path.split("/").at(-1);
+    page.reply(1, { task_id: taskId, request_id, snapshot_version: "80",
+      state: "cancelled", reason });
+    await click;
+    assert.equal(shared.values.get(versionKey), "2");
+    assert.equal(page.rows(), before);
+    assert.equal(page.fetches.length, 2);
+    assert.ok(page.button("取消任务").disabled);
   }
 });

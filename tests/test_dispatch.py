@@ -1091,3 +1091,41 @@ def test_release_write_failure_rolls_back_terminal_result(client, database, admi
         with pytest.raises(sqlite3.IntegrityError, match="synthetic release failure"):
             client.app.state.report_end(owner, report)
         assert end_state(observer, report.task_id) == before
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+def test_past_cutoff_cancellation_preserves_execution_until_result(
+    client, database, admitted_start, outcome
+):
+    from test_cancellations import history as all_history
+
+    headers, _, request = admitted_start
+    owner = Account("demo-a", "group-a")
+    started = client.app.state.confirm_start(owner, **request)
+    key = uuid4()
+    path = f"/api/tasks/{request['task_id']}/cancellations/{key}"
+    before = all_history(database)
+    receipt = client.post(path, headers=headers).json()
+    assert (receipt["state"], receipt["reason"]) == ("ineligible", "past_cutoff")
+    after = all_history(database)
+    assert after["gpu_leases"] == before["gpu_leases"]
+    assert after["simulated_start_events"] == before["simulated_start_events"]
+    assert client.app.state.confirm_start(owner, **request) == started
+    result = client.app.state.report_end(owner, EndReport(
+        **request, outcome=outcome, execution_ended=True, gpu_use_ended=True
+    ))
+    assert isinstance(result, EndConfirmed)
+    ended = all_history(database)
+    assert ended["cancellation_requests"] == after["cancellation_requests"]
+    assert ended["gpu_leases"][0][5] == result.released_version
+    assert client.post(path, headers=headers).json()["reason"] == "past_cutoff"
+    assert all_history(database) == ended
+
+    fresh_path = f"/api/tasks/{request['task_id']}/cancellations/{uuid4()}"
+    fresh = client.post(fresh_path, headers=headers).json()
+    assert (fresh["state"], fresh["reason"]) == ("ineligible", "past_cutoff")
+    after_fresh = all_history(database)
+    for table in ("tasks", "gpu_leases", "simulated_start_events", "simulated_results"):
+        assert after_fresh[table] == ended[table]
+    assert client.post(fresh_path, headers=headers).json() == fresh
+    assert all_history(database) == after_fresh

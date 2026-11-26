@@ -3,7 +3,7 @@
 import sqlite3
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
-from threading import Event
+from threading import Event, local
 from uuid import uuid4
 
 import pytest
@@ -37,6 +37,14 @@ def history(path):
         return {t: observer.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in tables}
 
 
+
+def assert_view(client, owner, task, status, eligible):
+    detail = client.get(f"/api/tasks/{task}", headers=owner).json()["task"]
+    listing = client.get("/api/tasks", headers=owner).json()["tasks"]
+    assert detail == next(row for row in listing if row["task_id"] == task)
+    assert (detail["status"], detail["can_cancel"]) == (status, eligible)
+
+
 def command(task, key):
     return f"/api/tasks/{task}/cancellations/{key}"
 
@@ -62,6 +70,7 @@ def test_cancel_once_moves_next_task_and_only_next_can_claim(database):
                 "cancelled",
                 int(receipt["snapshot_version"]) - 1,
                 int(receipt["snapshot_version"]),
+                None,
             )
         ]
         for suffix in ("", "/seal"):
@@ -90,7 +99,8 @@ def test_cancel_once_moves_next_task_and_only_next_can_claim(database):
         assert client.get(f"/api/tasks/{a}", headers=owner).json()["task"]["status"] == "cancelled"
 
 
-def test_unknown_refresh_then_seal_survives_restart_and_late_request(database):
+@pytest.mark.parametrize("admitted", [False, True])
+def test_unknown_refresh_then_seal_survives_restart_and_late_request(database, admitted):
     key = str(uuid4())
     held, destination = Event(), Future()
 
@@ -104,6 +114,10 @@ def test_unknown_refresh_then_seal_survives_restart_and_late_request(database):
         with TestClient(create_app(database), base_url=BASE_URL) as client:
             owner = login(client)
             task = api_submit(client, owner)["task_id"]
+            if admitted:
+                publish(client, {GPU_1: "idle", GPU_2: "busy"})
+                assert client.app.state.claim_head().task_id == task
+            assert_view(client, owner, task, "admitted" if admitted else "queued", True)
             path = command(task, key)
             delayed = workers.submit(deliver_late, path)
             assert held.wait(10)
@@ -113,6 +127,7 @@ def test_unknown_refresh_then_seal_survives_restart_and_late_request(database):
                 assert detail["task"]["cancellation"] == {"request_id": key, "state": "unknown"}
             assert history(database) == before
             assert client.post(path + "/seal", headers=owner).json()["state"] == "sealed"
+            assert_view(client, owner, task, "admitted" if admitted else "queued", True)
 
         with TestClient(create_app(database), base_url=BASE_URL) as client:
             owner = login(client)
@@ -153,23 +168,35 @@ def test_accepted_request_recovered_using_current_evidence(database, monkeypatch
     monkeypatch.setattr(cancellations, "_transition", transition)
     with TestClient(create_app(database), base_url=BASE_URL) as client:
         owner = login(client)
-        expected = "ineligible" if claim_first else "cancelled"
+        expected = "cancelled"
         before = history(database)
-        assert before["gpu_leases"] == leases_before_decision
+        if claim_first:
+            old, = leases_before_decision
+            new, = before["gpu_leases"]
+            assert new[:5] == old[:5]
+            assert new[5] == before["cancellation_requests"][0][5]
+            assert new[6] == 1 and new[7:] == old[7:]
+        else:
+            assert before["gpu_leases"] == []
         (row,) = before["cancellation_requests"]
         assert row[:4] == ("demo-a", task, key, expected)
         assert row[4] < row[5]
         assert client.post(path, headers=owner).json()["state"] == expected
         detail = client.get(f"/api/tasks/{task}?request_id={key}", headers=owner).json()["task"]
-        assert detail["status"] == ("admitted" if claim_first else "cancelled")
+        assert detail["status"] == "cancelled"
         assert not detail["can_cancel"]
         assert history(database) == before
 
 
-def test_nonowners_anonymous_and_invalid_csrf_cannot_change_requests(database):
+@pytest.mark.parametrize("admitted", [False, True])
+def test_nonowners_anonymous_and_invalid_csrf_cannot_change_requests(database, admitted):
     with TestClient(create_app(database), base_url=BASE_URL) as client:
         owner = login(client)
         task = api_submit(client, owner)["task_id"]
+        if admitted:
+            publish(client, {GPU_1: "idle", GPU_2: "busy"})
+            assert client.app.state.claim_head().task_id == task
+        assert_view(client, owner, task, "admitted" if admitted else "queued", True)
         key = uuid4()
         path = command(task, key)
         assert client.post(path + "/seal", headers=owner).json()["state"] == "sealed"
@@ -381,11 +408,16 @@ def test_overlapped_accept_seal_have_one_winner(database, monkeypatch, first):
 
 
 @pytest.mark.parametrize("committed", [False, True])
-def test_http_cancel_reconciles_lost_decision_commit(database, monkeypatch, committed):
+@pytest.mark.parametrize("admitted", [False, True])
+def test_http_cancel_reconciles_lost_decision_commit(database, monkeypatch, committed, admitted):
     original = SubmissionStore._connect
     with TestClient(create_app(database), base_url=BASE_URL) as client:
         owner = login(client)
         task = api_submit(client, owner)["task_id"]
+        if admitted:
+            publish(client, {GPU_1: "idle", GPU_2: "busy"})
+            assert client.app.state.claim_head().task_id == task
+        assert_view(client, owner, task, "admitted" if admitted else "queued", True)
         key = str(uuid4())
         before = history(database)
         decisions = []
@@ -418,7 +450,16 @@ def test_http_cancel_reconciles_lost_decision_commit(database, monkeypatch, comm
         after = history(database)
         (row,) = after["cancellation_requests"]
         assert row[2:4] == (key, "cancelled" if committed else "processing")
-        assert after["gpu_leases"] == after["simulated_start_events"] == []
+        assert after["simulated_start_events"] == []
+        if admitted:
+            old, = before["gpu_leases"]
+            lease, = after["gpu_leases"]
+            assert lease[:5] == old[:5]
+            assert lease[5] == (row[5] if committed else None)
+            assert lease[6] == int(committed)
+            assert lease[7:] == old[7:]
+        else:
+            assert after["gpu_leases"] == []
         if committed:
             assert response.status_code == 200
             assert response.json()["state"] == "cancelled"
@@ -429,3 +470,354 @@ def test_http_cancel_reconciles_lost_decision_commit(database, monkeypatch, comm
             assert row[5] is None
             assert after["tasks"] == before["tasks"]
             assert after["queue_state"][0][-1] == before["queue_state"][0][-1] + 1
+
+
+@pytest.mark.parametrize("first", ["cancel", "start"])
+def test_admitted_cancel_start_commit_order_and_lost_receipt(database, monkeypatch, first):
+    """A1–A3：受理不抢占裁决，独立连接只见原状态或完整终局。"""
+    from labqueue.starts import StartBlocked, StartConfirmed
+
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        owner = login(client)
+        a, b = [api_submit(client, owner)["task_id"] for _ in range(2)]
+        publish(client, {GPU_1: "idle", GPU_2: "busy"})
+        lease = client.app.state.claim_head()
+        args = dict(task_id=a, claim_id=lease.claim_id, gpu_uuid=lease.gpu_uuid)
+        account = Account("demo-a", "group-a")
+        key = str(uuid4())
+        assert_view(client, owner, a, "admitted", True)
+        entered, proceed, start_entering = Event(), Event(), Event()
+        start_commit, finish_start, cancel_entering = Event(), Event(), Event()
+        caller = local()
+        connect = SubmissionStore._connect
+
+        class ObserveStartLock:
+            def __init__(self, db):
+                self.db = db
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE" and getattr(caller, "starting", False):
+                    start_entering.set()
+                if sql == "BEGIN IMMEDIATE" and getattr(caller, "deciding", False):
+                    cancel_entering.set()
+                if sql == "COMMIT" and first == "start" and getattr(caller, "starting", False):
+                    start_commit.set()
+                    assert finish_start.wait(10)
+                return self.db.execute(sql, parameters)
+
+        monkeypatch.setattr(
+            SubmissionStore, "_connect", lambda store: ObserveStartLock(connect(store))
+        )
+
+        def competing_start():
+            caller.starting = True
+            return client.app.state.confirm_start(account, **args)
+        original = cancellations._transition
+        accepted = []
+
+        def pause(db, actor, task_id, fact, action):
+            if action == "decide":
+                accepted.append(history(database))
+                if first == "cancel":
+                    original(db, actor, task_id, fact, action)
+                    # 写入尚未提交，独立连接仍只见原任务、原租约和受理记录。
+                    assert history(database) == accepted[-1]
+                    entered.set()
+                    assert proceed.wait(10)
+                    return
+            original(db, actor, task_id, fact, action)
+
+        advance = cancellations._advance_once
+
+        def pause_before_lock(store, actor, task_id, request_id, action):
+            if first == "start" and action == "decide":
+                entered.set()
+                assert proceed.wait(10)
+                caller.deciding = True
+            return advance(store, actor, task_id, request_id, action)
+
+        monkeypatch.setattr(cancellations, "_transition", pause)
+        monkeypatch.setattr(cancellations, "_advance_once", pause_before_lock)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            cancellation = workers.submit(client.post, command(a, key), headers=owner)
+            assert entered.wait(10)
+            if first == "start":
+                before = history(database)
+                sealed = client.post(command(a, key) + "/seal", headers=owner).json()
+                assert sealed["state"] == "processing"
+                assert history(database) == before
+                start_attempt = workers.submit(competing_start)
+                assert start_commit.wait(10)
+                assert history(database) == before
+                proceed.set()
+                assert cancel_entering.wait(10)
+                assert history(database) == before
+                finish_start.set()
+                started = start_attempt.result(10)
+                assert isinstance(started, StartConfirmed)
+            else:
+                start_attempt = workers.submit(competing_start)
+                assert start_entering.wait(10)
+            proceed.set()
+            response = cancellation.result(10)
+            assert response.status_code == 200
+            # 丢弃命令响应，随后只读核对原 ID。
+            committed = history(database)
+            read = client.get(f"/api/tasks/{a}?request_id={key}", headers=owner).json()
+            receipt = dict(read["task"]["cancellation"], task_id=a,
+                           snapshot_version=read["snapshot_version"])
+            assert history(database) == committed
+            if first == "cancel":
+                assert isinstance(start_attempt.result(10), StartBlocked)
+                assert receipt["state"] == "cancelled"
+                assert committed["simulated_start_events"] == []
+                row, = committed["gpu_leases"]
+                assert row[5] == committed["cancellation_requests"][0][5]
+                assert row[6:9] == (1, 0, "not_started")
+                assert int(receipt["snapshot_version"]) == row[5]
+            else:
+                assert receipt["state"] == "ineligible" and receipt["reason"] == "past_cutoff"
+                assert len(committed["simulated_start_events"]) == 1
+                assert committed["gpu_leases"][0][5] is None
+                assert client.app.state.confirm_start(account, **args) == started
+            for suffix in ("", "/seal"):
+                assert client.post(command(a, key) + suffix, headers=owner).json() == receipt
+            assert history(database) == committed
+            detail = client.get(f"/api/tasks/{a}?request_id={key}", headers=owner).json()
+            listing = client.get(
+                "/api/tasks", params={"pending": f"{a}.{key}"}, headers=owner
+            ).json()
+            assert detail["task"] == listing["tasks"][0]
+            assert not detail["task"]["can_cancel"]
+            if first == "cancel":
+                assert isinstance(client.app.state.confirm_start(account, **args), StartBlocked)
+                next_lease = client.app.state.claim_head()
+                assert (next_lease.task_id, next_lease.gpu_uuid) == (b, GPU_1)
+                assert history(database)["gpu_leases"][0] == committed["gpu_leases"][0]
+
+
+@pytest.mark.parametrize("fault", [
+    "read_failure", "unknown", "pending", "confirmed_without_event", "running_without_event",
+    "event_owner", "event_gpu", "event_claim", "event_without_confirmation",
+    "release_failure", "task_failure", "resolution_failure", "version_failure",
+])
+def test_incomplete_start_evidence_or_release_failure_preserves_original_lease(
+    database, monkeypatch, fault
+):
+    """A12 及回滚：证据缺失或矛盾不能推断原卡空闲。"""
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        owner = login(client)
+        task = api_submit(client, owner)["task_id"]
+        publish(client, {GPU_1: "idle", GPU_2: "busy"})
+        lease = client.app.state.claim_head()
+        if fault.startswith("event_"):
+            client.app.state.confirm_start(
+                Account("demo-a", "group-a"), task_id=task,
+                claim_id=lease.claim_id, gpu_uuid=lease.gpu_uuid
+            )
+        with closing(sqlite3.connect(database)) as db:
+            changes = {
+                "unknown": "UPDATE gpu_leases SET execution_evidence='unknown'",
+                "pending": "UPDATE gpu_leases SET reconciliation_pending=1",
+                "confirmed_without_event": "UPDATE gpu_leases SET start_confirmed=1",
+                "running_without_event": "UPDATE tasks SET status='running'",
+                "event_owner": "UPDATE simulated_start_events SET execution_owner_id='demo-b'",
+                "event_gpu": "UPDATE simulated_start_events SET gpu_uuid='wrong-gpu'",
+                "event_claim": "UPDATE simulated_start_events SET claim_id='wrong-claim'",
+                "event_without_confirmation": "UPDATE gpu_leases SET start_confirmed=0",
+                "version_failure": """CREATE TRIGGER deny_version
+                    BEFORE UPDATE OF snapshot_version ON queue_state
+                    WHEN EXISTS (SELECT 1 FROM cancellation_requests WHERE state='cancelled')
+                    BEGIN SELECT RAISE(IGNORE); END""",
+                "task_failure": """CREATE TRIGGER deny_task BEFORE UPDATE OF status
+                    ON tasks BEGIN SELECT RAISE(IGNORE); END""",
+                "resolution_failure": """CREATE TRIGGER deny_resolution BEFORE UPDATE OF state
+                    ON cancellation_requests BEGIN SELECT RAISE(IGNORE); END""",
+                "release_failure": """CREATE TRIGGER deny_release BEFORE UPDATE OF released_version
+                    ON gpu_leases BEGIN SELECT RAISE(IGNORE); END""",
+            }
+            if fault in changes:
+                db.execute(changes[fault])
+                db.commit()
+        if fault == "read_failure":
+            def unavailable(db, task_id):
+                raise sqlite3.OperationalError("synthetic evidence read failure")
+            monkeypatch.setattr(cancellations, "read_start", unavailable)
+        monkeypatch.setattr(client.app.state, "wake_recovery", lambda: None)
+        before = history(database)
+        key = str(uuid4())
+        assert client.post(command(task, key), headers=owner).status_code == 503
+        after = history(database)
+        for table in ("tasks", "gpu_leases", "simulated_start_events", "simulated_results"):
+            assert after[table] == before[table]
+        assert after["cancellation_requests"][0][2:4] == (key, "processing")
+        assert after["cancellation_requests"][0][5] is None
+        assert after["queue_state"][0][-1] == before["queue_state"][0][-1] + 1
+
+
+def test_old_database_migration_preserves_terminal_and_sealed_requests(database):
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        owner = login(client)
+        task = api_submit(client, owner)["task_id"]
+        terminal, sealed, cancelled, pending = [str(uuid4()) for _ in range(4)]
+        client.post(command(task, terminal), headers=owner)
+        client.post(command(task, sealed) + "/seal", headers=owner)
+        cancelled_task = api_submit(client, owner)["task_id"]
+        client.post(command(cancelled_task, cancelled), headers=owner)
+        pending_task = api_submit(client, owner)["task_id"]
+        cancellations._advance(SubmissionStore(database), Account("demo-a", "group-a"),
+                               pending_task, pending, "accept")
+    with closing(sqlite3.connect(database)) as db:
+        db.execute(
+            "UPDATE cancellation_requests SET state='ineligible' WHERE request_id=?", (terminal,)
+        )
+        db.execute("ALTER TABLE cancellation_requests DROP COLUMN reason")
+        db.commit()
+    old = history(database)
+    for _ in range(2):
+        with TestClient(create_app(database), base_url=BASE_URL) as client:
+            owner = login(client)
+            before = history(database)
+            migrated = [row[:-1] for row in before["cancellation_requests"] if row[2] != pending]
+            assert migrated == [row for row in old["cancellation_requests"] if row[2] != pending]
+            recovered, = [row for row in before["cancellation_requests"] if row[2] == pending]
+            original, = [row for row in old["cancellation_requests"] if row[2] == pending]
+            assert recovered[:3] == original[:3] and recovered[3] == "cancelled"
+            assert recovered[4] == original[4] and recovered[5] > recovered[4]
+            assert all(row[-1] is None for row in before["cancellation_requests"])
+            for key, state in ((terminal, "ineligible"), (sealed, "sealed")):
+                receipt = client.post(command(task, key), headers=owner).json()
+                assert receipt["state"] == state and "reason" not in receipt
+            for target, key in ((cancelled_task, cancelled), (pending_task, pending)):
+                receipt = client.post(command(target, key), headers=owner).json()
+                assert receipt["state"] == "cancelled"
+            assert history(database) == before
+
+
+def test_restart_recovers_accepted_id_after_start_won(database, monkeypatch):
+    transition = cancellations._transition
+    key = str(uuid4())
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        headers = login(client)
+        task = api_submit(client, headers)["task_id"]
+        publish(client, {GPU_1: "idle", GPU_2: "busy"})
+        lease = client.app.state.claim_head()
+
+        def unavailable(db, account, task_id, fact, action):
+            if action == "decide":
+                raise sqlite3.OperationalError("synthetic interruption")
+            return transition(db, account, task_id, fact, action)
+
+        monkeypatch.setattr(cancellations, "_transition", unavailable)
+        monkeypatch.setattr(client.app.state, "wake_recovery", lambda: None)
+        assert client.post(command(task, key), headers=headers).status_code == 503
+        client.app.state.confirm_start(Account("demo-a", "group-a"), task_id=task,
+                                       claim_id=lease.claim_id, gpu_uuid=lease.gpu_uuid)
+        before = history(database)
+    monkeypatch.setattr(cancellations, "_transition", transition)
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        headers = login(client)
+        after = history(database)
+        row, = after["cancellation_requests"]
+        assert row[2:4] == (key, "ineligible") and row[-1] == "past_cutoff"
+        assert after["gpu_leases"] == before["gpu_leases"]
+        assert after["simulated_start_events"] == before["simulated_start_events"]
+        for suffix in ("", "/seal"):
+            receipt = client.post(command(task, key) + suffix, headers=headers).json()
+            assert receipt["reason"] == "past_cutoff"
+        assert history(database) == after
+
+
+def test_admitted_seal_lost_receipt_manual_repeat_is_read_only(database):
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        owner = login(client)
+        task = api_submit(client, owner)["task_id"]
+        publish(client, {GPU_1: "idle", GPU_2: "busy"})
+        client.app.state.claim_head()
+        key = str(uuid4())
+        path = command(task, key) + "/seal"
+        client.post(path, headers=owner)  # 模拟用户没有收到第一次封存回执。
+        before = history(database)
+        assert client.post(path, headers=owner).json()["state"] == "sealed"
+        assert history(database) == before
+        assert before["gpu_leases"][0][5] is None
+
+
+def test_two_cancel_ids_race_release_original_lease_once(database, monkeypatch):
+    from labqueue.starts import StartBlocked
+
+    with TestClient(create_app(database), base_url=BASE_URL) as client:
+        owner = login(client)
+        task = api_submit(client, owner)["task_id"]
+        publish(client, {GPU_1: "idle", GPU_2: "busy"})
+        lease = client.app.state.claim_head()
+        first, second = str(uuid4()), str(uuid4())
+        holding, competing, proceed = Event(), Event(), Event()
+        local_request = local()
+        connect, advance = SubmissionStore._connect, cancellations._advance_once
+        transition = cancellations._transition
+        release_writes = []
+
+        class ObserveWrites:
+            def __init__(self, db):
+                self.db = db
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE" and getattr(local_request, "id", None) == second:
+                    competing.set()
+                cursor = self.db.execute(sql, parameters)
+                if "UPDATE gpu_leases SET startup_revoked=1" in sql:
+                    release_writes.append(cursor.rowcount)
+                return cursor
+
+        def identify(store, actor, task_id, key, action):
+            local_request.id = key
+            return advance(store, actor, task_id, key, action)
+
+        def pause(db, actor, task_id, fact, action):
+            if fact.request_id == first and action == "decide":
+                before = history(database)
+                transition(db, actor, task_id, fact, action)
+                assert history(database) == before
+                holding.set()
+                assert proceed.wait(10)
+                return
+            transition(db, actor, task_id, fact, action)
+
+        monkeypatch.setattr(
+            SubmissionStore, "_connect", lambda store: ObserveWrites(connect(store))
+        )
+        monkeypatch.setattr(cancellations, "_advance_once", identify)
+        monkeypatch.setattr(cancellations, "_transition", pause)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            one = workers.submit(client.post, command(task, first), headers=owner)
+            assert holding.wait(10)
+            two = workers.submit(client.post, command(task, second), headers=owner)
+            try:
+                assert competing.wait(10)
+            finally:
+                proceed.set()
+            assert one.result(10).json()["state"] == "cancelled"
+            assert two.result(10).json()["state"] == "ineligible"
+        before = history(database)
+        assert release_writes == [1]
+        row, = before["gpu_leases"]
+        assert row[0] == lease.claim_id and row[5] is not None and row[6] == 1
+        assert [(r[2], r[3]) for r in before["cancellation_requests"]] == [
+            (first, "cancelled"), (second, "ineligible")
+        ]
+        assert all(r[5] is not None for r in before["cancellation_requests"])
+        for key in (first, second):
+            for suffix in ("", "/seal"):
+                assert client.post(command(task, key) + suffix, headers=owner).status_code == 200
+        assert isinstance(client.app.state.confirm_start(Account("demo-a", "group-a"),
+            task_id=task, claim_id=lease.claim_id, gpu_uuid=lease.gpu_uuid), StartBlocked)
+        assert history(database) == before
+        assert release_writes == [1]
+        assert_view(client, owner, task, "cancelled", False)

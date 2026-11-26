@@ -411,12 +411,14 @@ class SubmissionStore:
                 rows = []
             facts = {}
             if pending and rows:
-                for key, request_id, state in db.execute("""
-                    SELECT p.key, p.value, coalesce(r.state, 'unknown')
+                for key, request_id, state, cancel_reason in db.execute("""
+                    SELECT p.key, p.value, coalesce(r.state, 'unknown'), r.reason
                     FROM json_each(?) p LEFT JOIN cancellation_requests r
                       ON r.owner_id=? AND r.task_id=p.key AND r.request_id=p.value
                 """, (json.dumps(pending), account.owner_id)):
-                    facts[key] = CancellationFact(request_id=request_id, state=state)
+                    facts[key] = CancellationFact(
+                        request_id=request_id, state=state, reason=cancel_reason
+                    )
             tasks = [
                 TaskView(
                     task_id=row["task_id"],
