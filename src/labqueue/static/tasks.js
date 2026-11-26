@@ -240,8 +240,13 @@ function addCancelControl(card, task) {
           accessVersionStorage(() => localStorage.setItem(versionKey, receipt.snapshot_version));
           versionFloor = receipt.snapshot_version;
         }
+        if (pendingRequests()[detailId] !== id) {
+          if (displayedVersion !== null && earlierVersion(displayedVersion, versionFloor)) {
+            markLastConfirmed("已有更新，请刷新此页。");
+          }
+          return;
+        }
         markLastConfirmed("已收到取消回执，正在核对完整任务。");
-        if (pendingRequests()[detailId] !== id) return;
         matched = true;
       });
       if (matched) await refreshTasks();

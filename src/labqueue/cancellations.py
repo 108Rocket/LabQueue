@@ -27,6 +27,10 @@ class CancellationReceipt(CancellationFact):
     snapshot_version: str
 
 
+class CancellationDeferred(sqlite3.DatabaseError):
+    """该请求的失败已持久隔离，服务可继续恢复其他请求。"""
+
+
 def initialize_cancellations(db: sqlite3.Connection) -> None:
     db.execute("CREATE INDEX IF NOT EXISTS lease_history_by_task ON gpu_leases(task_id)")
     db.execute("""
@@ -42,9 +46,17 @@ def initialize_cancellations(db: sqlite3.Connection) -> None:
     """)
     if "reason" not in {row[1] for row in db.execute("PRAGMA table_info(cancellation_requests)")}:
         db.execute("ALTER TABLE cancellation_requests ADD COLUMN reason TEXT")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS cancellation_recovery_blocks (
+            owner_id TEXT NOT NULL, task_id TEXT NOT NULL, request_id TEXT NOT NULL,
+            PRIMARY KEY (owner_id, task_id, request_id),
+            FOREIGN KEY (owner_id, task_id, request_id)
+                REFERENCES cancellation_requests(owner_id, task_id, request_id)
+        )
+    """)
 
 
-CANCEL_ELIGIBLE_SQL = """
+BASE_CANCEL_ELIGIBLE_SQL = """
     ((t.status = 'queued'
       AND NOT EXISTS (SELECT 1 FROM gpu_leases WHERE task_id = t.task_id))
      OR (t.status = 'admitted' AND EXISTS (
@@ -52,6 +64,9 @@ CANCEL_ELIGIBLE_SQL = """
           AND l.released_version IS NULL AND l.start_confirmed = 0
           AND l.execution_evidence = 'not_started' AND l.reconciliation_pending = 0)))
     AND NOT EXISTS (SELECT 1 FROM simulated_start_events WHERE task_id = t.task_id)
+"""
+CANCEL_ELIGIBLE_SQL = BASE_CANCEL_ELIGIBLE_SQL + """
+    AND NOT EXISTS (SELECT 1 FROM cancellation_recovery_blocks WHERE task_id = t.task_id)
 """
 
 
@@ -114,7 +129,7 @@ def _decide(db: sqlite3.Connection, account: Account, task_id: str) -> tuple[str
         if released != 1:
             raise sqlite3.IntegrityError("取消未能封闭并释放原领取")
     elif not db.execute(
-        f"SELECT 1 FROM tasks t WHERE t.task_id=? AND {CANCEL_ELIGIBLE_SQL}", (task_id,)
+        f"SELECT 1 FROM tasks t WHERE t.task_id=? AND {BASE_CANCEL_ELIGIBLE_SQL}", (task_id,)
     ).fetchone():
         return "ineligible", None
     changed = db.execute(
@@ -168,7 +183,39 @@ def _advance_once(
         if not store.owns_task(db, account, task_id):
             return None
         fact = cancellation_fact(db, account.owner_id, task_id, request_id)
-        _transition(db, account, task_id, fact, action)
+        if action == "decide" and fact.state == "processing":
+            db.execute("SAVEPOINT cancel_decision")
+            try:
+                _transition(db, account, task_id, fact, action)
+            except sqlite3.Error as error:
+                # 仍持有写锁：先撤回裁决的全部局部写入，再持久隔离该原 ID。
+                try:
+                    db.execute("ROLLBACK TO cancel_decision")
+                    inserted = db.execute("""
+                        INSERT OR IGNORE INTO cancellation_recovery_blocks VALUES (?, ?, ?)
+                    """, (account.owner_id, task_id, request_id)).rowcount
+                    if not db.execute("""
+                        SELECT 1 FROM cancellation_recovery_blocks
+                        WHERE owner_id=? AND task_id=? AND request_id=?
+                    """, (account.owner_id, task_id, request_id)).fetchone():
+                        raise sqlite3.IntegrityError("无法证实取消恢复阻断记录")
+                    if inserted and db.execute("""
+                        UPDATE queue_state SET snapshot_version=snapshot_version+1 WHERE id=1
+                    """).rowcount != 1:
+                        raise sqlite3.IntegrityError("无法提交取消恢复阻断版本")
+                    db.execute("COMMIT")
+                except sqlite3.Error:
+                    # 全面存储故障不视为成功隔离；进程重启并重新核实前保持关闭。
+                    store.cancellation_storage_failed = True
+                    raise
+                raise CancellationDeferred("取消原请求已隔离，等待服务重试") from error
+            db.execute("RELEASE cancel_decision")
+            db.execute("""
+                DELETE FROM cancellation_recovery_blocks
+                WHERE owner_id=? AND task_id=? AND request_id=?
+            """, (account.owner_id, task_id, request_id))
+        else:
+            _transition(db, account, task_id, fact, action)
         receipt = _receipt(db, task_id, fact)
         try:
             db.execute("COMMIT")
@@ -222,12 +269,17 @@ def cancel(
     return receipt
 
 
-def recover_cancellations(store: "SubmissionStore") -> None:
+def recover_cancellations(store: "SubmissionStore") -> bool:
     with closing(store._connect_readonly()) as db:
         pending = db.execute("""
             SELECT r.owner_id, t.group_id, r.task_id, r.request_id
             FROM cancellation_requests r JOIN tasks t USING (owner_id, task_id)
             WHERE r.state='processing'
         """).fetchall()
+    retry = False
     for owner_id, group_id, task_id, request_id in pending:
-        _advance(store, Account(owner_id, group_id), task_id, request_id, "decide")
+        try:
+            _advance(store, Account(owner_id, group_id), task_id, request_id, "decide")
+        except CancellationDeferred:
+            retry = True
+    return retry

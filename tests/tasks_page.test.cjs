@@ -1086,3 +1086,51 @@ test("非法原因的取消命令回执不提高版本或触发完整核对", as
     assert.ok(page.button("取消任务").disabled);
   }
 });
+
+for (const detail of [false, true]) {
+  for (const receiptVersion of ["4", "12"]) {
+    test(`${detail ? "详情" : "列表"} 新 ID sealed v10 后旧 ID v${receiptVersion} 仅按版本失效缓存`, async () => {
+      const shared = makeSharedVersionStore();
+      const commandPage = makePage(true, shared);
+      const page = detail ? commandPage : makePage(false, shared);
+      const admitted = { status: "admitted", can_cancel: true,
+        queue_position: null, waiting_reason: null };
+      commandPage.reply(0, snapshot(true, "2", admitted));
+      if (!detail) page.reply(0, snapshot(false, "2", admitted));
+      await settle();
+      const oldCommand = commandPage.button("取消任务").fire("click");
+      await settle();
+      const oldId = commandPage.fetches[1].path.split("/").at(-1);
+      const newId = "58d3dc13-67b6-427b-81fb-524090a6f733";
+      const pendingKey = "labqueue.cancel-requests.test-session";
+      // 模拟另一页面已完成新 ID 的主动封存，当前页面再读取完整快照。
+      shared.values.set(pendingKey, JSON.stringify({ [taskId]: newId }));
+      for (const [target, view] of detail ? [[page, true]] : [[commandPage, true], [page, false]]) {
+        const read = target.refresh();
+        target.reply(target.fetches.length - 1, snapshot(view, "10", { ...admitted,
+          cancellation: { request_id: newId, state: "sealed" } }));
+        await read;
+      }
+      const before = page.rows();
+      const feedback = page.feedback();
+      const requests = commandPage.fetches.length;
+      assert.ok(!commandPage.button("取消任务").disabled);
+      commandPage.reply(1, { task_id: taskId, request_id: oldId,
+        state: "sealed", snapshot_version: receiptVersion });
+      await oldCommand;
+      if (!detail) await page.fire("storage", { key: versionKey });
+      assert.equal(page.rows(), before);
+      assert.equal(commandPage.fetches.length, requests);
+      assert.equal(JSON.parse(shared.values.get(pendingKey))[taskId], newId);
+      if (receiptVersion === "4") {
+        assert.equal(shared.values.get(versionKey), "10");
+        assert.equal(page.feedback(), feedback);
+        assert.ok(!commandPage.button("取消任务").disabled);
+      } else {
+        assert.equal(shared.values.get(versionKey), "12");
+        assert.match(page.feedback(), /上次确认/);
+        assert.ok(commandPage.button("取消任务").disabled);
+      }
+    });
+  }
+}

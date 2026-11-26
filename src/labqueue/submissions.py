@@ -44,6 +44,7 @@ from labqueue.results import (
     read_result,
 )
 from labqueue.starts import (
+    StartBlocked,
     StartCommitUnknown,
     StartConfirmed,
     StartResult,
@@ -119,6 +120,7 @@ class CommitUncertain(Exception):
 class SubmissionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.cancellation_storage_failed = False
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=LOCK_WAIT_SECONDS, autocommit=True)
@@ -213,6 +215,8 @@ class SubmissionStore:
         result: ClaimResult
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
+            if self.cancellation_storage_failed:
+                return ClaimBlocked("gpu_visibility_unknown")
             try:
                 admission = read_admission_for_dispatch(db)
                 options = dispatch_options(db, admission)
@@ -264,6 +268,8 @@ class SubmissionStore:
     ) -> StartResult:
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
+            if self.cancellation_storage_failed:
+                return StartBlocked("execution_unverified")
             try:
                 result = decide_start(db, executor, task_id, claim_id, gpu_uuid)
             except BaseException:

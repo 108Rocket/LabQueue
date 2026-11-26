@@ -84,7 +84,9 @@ def decide_start(
         ):
             return event
         return StartBlocked("execution_unverified")
-    if current["reconciliation_pending"]:
+    if current["reconciliation_pending"] or db.execute(
+        "SELECT 1 FROM cancellation_recovery_blocks WHERE task_id=?", (task_id,)
+    ).fetchone():
         return StartBlocked("reconciliation_pending")
     if current["start_confirmed"] or current["execution_evidence"] != "not_started":
         return StartBlocked("execution_unverified")

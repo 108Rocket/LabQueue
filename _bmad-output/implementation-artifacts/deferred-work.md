@@ -15,3 +15,4 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-2-裁决已领取任务的取消与启动竞争.md`
   summary: Story 3.3 处理未终结取消的未知证据在启动恢复时阻断整个服务的问题。
   evidence: cancellations._decide 对未知/待核对证据抛 DatabaseError，recover_cancellations 未逐请求处理，app.lifespan 启动恢复会中断并跳过后续请求；完整待核对与恢复验收为用户明确延后范围。
+  resolution: 用户独立复审否决将服务启动中断延期，本轮修复逐请求持久隔离、其他原 ID 恢复及服务端定时重试；故障原租约不封闭不释放。此缺陷不再作为 3.3 待办。3.3 仍负责完整未知执行事实状态机、证据分类、组合故障及恢复/回队验收。

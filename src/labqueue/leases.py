@@ -80,6 +80,11 @@ def dispatch_options(db: sqlite3.Connection, state: AdmissionState) -> DispatchO
     if state.waiting_reason not in ("waiting_dispatch", "gpu_busy"):
         return DispatchOptions(state.waiting_reason, head_id)
 
+    if head_id is not None and db.execute(
+        "SELECT 1 FROM cancellation_recovery_blocks WHERE task_id=?", (head_id,)
+    ).fetchone():
+        return DispatchOptions("gpu_visibility_unknown", head_id)
+
     if head is not None and db.execute("""
         SELECT 1 FROM gpu_leases AS lease JOIN tasks AS task USING (task_id)
         WHERE lease.released_version IS NULL AND task.status = 'admitted'
