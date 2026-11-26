@@ -108,12 +108,14 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         ):
             raise RuntimeError("检测到旧任务库，请先停服并将 SQLite 备份迁入账号私有目录")
         app.state.observations = store.initialize()
-        recover_cancellations(store)
+        recovery_pending = recover_cancellations(store)
         app.state.claim_head = store.claim_head
         app.state.report_end = store.report_end
         app.state.confirm_start = store.confirm_start
         app.state.sessions = DemoSessions()
         requested = asyncio.Event()
+        if recovery_pending:
+            requested.set()
         stopping = False
         loop = asyncio.get_running_loop()
         app.state.wake_recovery = lambda: loop.call_soon_threadsafe(requested.set)
@@ -125,8 +127,10 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                     return
                 requested.clear()
                 try:
-                    await asyncio.to_thread(recover_cancellations, store)
+                    retry = await asyncio.to_thread(recover_cancellations, store)
                 except sqlite3.Error:
+                    retry = True
+                if retry:
                     await asyncio.sleep(0.5)
                     requested.set()
 

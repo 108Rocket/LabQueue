@@ -46,6 +46,14 @@ function earlierVersion(version, other) {
   return version.length === other.length ? version < other : version.length < other.length;
 }
 
+function isCancellationFact(fact) {
+  return fact && typeof fact === "object" && !Array.isArray(fact)
+    && typeof fact.request_id === "string" && taskUuid.test(fact.request_id)
+    && Object.hasOwn(cancelLabels, fact.state)
+    && (fact.reason === undefined || fact.reason === null
+      || (fact.state === "ineligible" && fact.reason === "past_cutoff"));
+}
+
 function isTaskView(task) {
   if (!task || typeof task !== "object" || Array.isArray(task)
       || typeof task.task_id !== "string" || !taskUuid.test(task.task_id)
@@ -56,9 +64,10 @@ function isTaskView(task) {
       || typeof task.status !== "string" || !task.status.trim()
       || (task.failure_reason !== undefined
           && (task.status !== "failed" || task.failure_reason !== "oom"))
-      || typeof task.can_cancel !== "boolean" || (task.can_cancel && task.status !== "queued")
-      || (task.cancellation !== undefined && (!taskUuid.test(task.cancellation?.request_id)
-          || !Object.hasOwn(cancelLabels, task.cancellation?.state)))) {
+      || typeof task.can_cancel !== "boolean"
+      || (task.can_cancel && !["queued", "admitted"].includes(task.status))
+      || (task.cancellation !== undefined && (!isCancellationFact(task.cancellation)
+          || (task.cancellation.reason === "past_cutoff" && task.can_cancel)))) {
     return false;
   }
   if (task.status === "queued") {
@@ -179,7 +188,8 @@ function taskCard(task, outputId) {
   card.append(registration);
   if (task.cancellation) {
     const notice = document.createElement("p");
-    notice.textContent = cancelLabels[task.cancellation.state];
+    notice.textContent = task.cancellation.reason === "past_cutoff"
+      ? "启动已确认，已过取消截止点。本次未取消任务。" : cancelLabels[task.cancellation.state];
     card.append(notice);
   }
   if (detailId) addCancelControl(card, task);
@@ -200,7 +210,7 @@ function addCancelControl(card, task) {
     if (button.disabled || taskResults.hidden || !checkTaskSession()) return;
     const prompt = seal
       ? `核对「${task.name}」的旧取消请求？未受理的请求将被封存；已受理的请求会保留处理结果或继续处理。`
-      : `确认取消排队任务「${task.name}」？`;
+      : `确认取消任务「${task.name}」？仅在启动尚未确认时可取消。`;
     if (!window.confirm(prompt)) return;
     const epoch = readEpoch;
     let id;
@@ -224,12 +234,17 @@ function addCancelControl(card, task) {
       });
       let matched = false;
       await withVersionFloor(() => {
-        if (epoch !== readEpoch || pendingRequests()[detailId] !== id
-            || receipt?.request_id !== id || receipt.task_id !== detailId
-            || !Object.hasOwn(cancelLabels, receipt.state) || !isDecimal(receipt.snapshot_version)) return;
+        if (epoch !== readEpoch || receipt?.request_id !== id || receipt.task_id !== detailId
+            || !isCancellationFact(receipt) || !isDecimal(receipt.snapshot_version)) return;
         if (earlierVersion(versionFloor, receipt.snapshot_version)) {
           accessVersionStorage(() => localStorage.setItem(versionKey, receipt.snapshot_version));
           versionFloor = receipt.snapshot_version;
+        }
+        if (pendingRequests()[detailId] !== id) {
+          if (displayedVersion !== null && earlierVersion(displayedVersion, versionFloor)) {
+            markLastConfirmed("已有更新，请刷新此页。");
+          }
+          return;
         }
         markLastConfirmed("已收到取消回执，正在核对完整任务。");
         matched = true;

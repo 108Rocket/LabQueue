@@ -2,10 +2,12 @@
 
 import json
 import sqlite3
-from contextlib import closing
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -44,6 +46,7 @@ from labqueue.results import (
     read_result,
 )
 from labqueue.starts import (
+    StartBlocked,
     StartCommitUnknown,
     StartConfirmed,
     StartResult,
@@ -119,6 +122,17 @@ class CommitUncertain(Exception):
 class SubmissionStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._execution_lock = Lock()
+        self.cancellation_storage_failed = False
+
+    @contextmanager
+    def execution_writer(self) -> Iterator[sqlite3.Connection]:
+        """SQLite 写权在先，实例锁在后。持锁区间内不重新申请数据库写权。"""
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            # SQLite 自动回滚或连接关闭也不会提前解除这把锁。
+            with self._execution_lock:
+                yield db
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=LOCK_WAIT_SECONDS, autocommit=True)
@@ -211,8 +225,9 @@ class SubmissionStore:
 
     def _claim_head(self) -> ClaimResult:
         result: ClaimResult
-        with closing(self._connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.execution_writer() as db:
+            if self.cancellation_storage_failed:
+                return ClaimBlocked("gpu_visibility_unknown")
             try:
                 admission = read_admission_for_dispatch(db)
                 options = dispatch_options(db, admission)
@@ -262,8 +277,9 @@ class SubmissionStore:
     def _confirm_start(
         self, executor: Account, task_id: str, claim_id: str, gpu_uuid: str
     ) -> StartResult:
-        with closing(self._connect()) as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self.execution_writer() as db:
+            if self.cancellation_storage_failed:
+                return StartBlocked("execution_unverified")
             try:
                 result = decide_start(db, executor, task_id, claim_id, gpu_uuid)
             except BaseException:
@@ -411,12 +427,14 @@ class SubmissionStore:
                 rows = []
             facts = {}
             if pending and rows:
-                for key, request_id, state in db.execute("""
-                    SELECT p.key, p.value, coalesce(r.state, 'unknown')
+                for key, request_id, state, cancel_reason in db.execute("""
+                    SELECT p.key, p.value, coalesce(r.state, 'unknown'), r.reason
                     FROM json_each(?) p LEFT JOIN cancellation_requests r
                       ON r.owner_id=? AND r.task_id=p.key AND r.request_id=p.value
                 """, (json.dumps(pending), account.owner_id)):
-                    facts[key] = CancellationFact(request_id=request_id, state=state)
+                    facts[key] = CancellationFact(
+                        request_id=request_id, state=state, reason=cancel_reason
+                    )
             tasks = [
                 TaskView(
                     task_id=row["task_id"],

@@ -4,12 +4,13 @@ import sqlite3
 from contextlib import closing
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from labqueue.submissions import SubmissionStore
 
 from labqueue.auth import Account
+from labqueue.starts import read_start
 from labqueue.storage import rollback_open_transaction
 
 CancelState = Literal["unknown", "processing", "sealed", "cancelled", "ineligible"]
@@ -18,11 +19,16 @@ CancelState = Literal["unknown", "processing", "sealed", "cancelled", "ineligibl
 class CancellationFact(BaseModel):
     request_id: str
     state: CancelState
+    reason: Literal["past_cutoff"] | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class CancellationReceipt(CancellationFact):
     task_id: str
     snapshot_version: str
+
+
+class CancellationDeferred(sqlite3.DatabaseError):
+    """该请求的失败已持久隔离，服务可继续恢复其他请求。"""
 
 
 def initialize_cancellations(db: sqlite3.Connection) -> None:
@@ -38,12 +44,29 @@ def initialize_cancellations(db: sqlite3.Connection) -> None:
             PRIMARY KEY (owner_id, task_id, request_id)
         )
     """)
+    if "reason" not in {row[1] for row in db.execute("PRAGMA table_info(cancellation_requests)")}:
+        db.execute("ALTER TABLE cancellation_requests ADD COLUMN reason TEXT")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS cancellation_recovery_blocks (
+            owner_id TEXT NOT NULL, task_id TEXT NOT NULL, request_id TEXT NOT NULL,
+            PRIMARY KEY (owner_id, task_id, request_id),
+            FOREIGN KEY (owner_id, task_id, request_id)
+                REFERENCES cancellation_requests(owner_id, task_id, request_id)
+        )
+    """)
 
 
-CANCEL_ELIGIBLE_SQL = """
-    t.status = 'queued'
-    AND NOT EXISTS (SELECT 1 FROM gpu_leases WHERE task_id = t.task_id)
+BASE_CANCEL_ELIGIBLE_SQL = """
+    ((t.status = 'queued'
+      AND NOT EXISTS (SELECT 1 FROM gpu_leases WHERE task_id = t.task_id))
+     OR (t.status = 'admitted' AND EXISTS (
+        SELECT 1 FROM gpu_leases l WHERE l.task_id = t.task_id
+          AND l.released_version IS NULL AND l.start_confirmed = 0
+          AND l.execution_evidence = 'not_started' AND l.reconciliation_pending = 0)))
     AND NOT EXISTS (SELECT 1 FROM simulated_start_events WHERE task_id = t.task_id)
+"""
+CANCEL_ELIGIBLE_SQL = BASE_CANCEL_ELIGIBLE_SQL + """
+    AND NOT EXISTS (SELECT 1 FROM cancellation_recovery_blocks WHERE task_id = t.task_id)
 """
 
 
@@ -52,21 +75,69 @@ def cancellation_fact(
 ) -> CancellationFact:
     row = db.execute(
         """
-        SELECT state FROM cancellation_requests WHERE owner_id=? AND task_id=? AND request_id=?
+        SELECT state, reason FROM cancellation_requests
+        WHERE owner_id=? AND task_id=? AND request_id=?
     """,
         (owner_id, task_id, request_id),
     ).fetchone()
-    return CancellationFact(request_id=request_id, state=row[0] if row else "unknown")
+    return CancellationFact(
+        request_id=request_id, state=row[0] if row else "unknown", reason=row[1] if row else None
+    )
 
 
 def _receipt(db: sqlite3.Connection, task_id: str, fact: CancellationFact) -> CancellationReceipt:
     version = db.execute("SELECT snapshot_version FROM queue_state WHERE id=1").fetchone()[0]
     return CancellationReceipt(
-        task_id=task_id, snapshot_version=str(version), request_id=fact.request_id, state=fact.state
+        task_id=task_id, snapshot_version=str(version), **fact.model_dump()
     )
 
 
 Action = Literal["accept", "seal", "decide"]
+
+
+def _decide(db: sqlite3.Connection, account: Account, task_id: str) -> tuple[str, str | None]:
+    """以完整匹配的执行证据裁决取消，证据不明时保留原领取。"""
+    status = db.execute("SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0]
+    event = read_start(db, task_id)
+    if event is not None:
+        confirmed = db.execute("""
+            SELECT 1 FROM gpu_leases WHERE task_id=? AND claim_id=? AND gpu_uuid=?
+              AND start_confirmed=1 AND execution_evidence != 'not_started'
+              AND (? != 'running' OR released_version IS NULL)
+        """, (task_id, event.claim_id, event.gpu_uuid, status)).fetchone()
+        if (
+            confirmed and status in ("running", "completed", "failed")
+            and event.task_id == task_id and event.execution_owner_id == account.owner_id
+        ):
+            return "ineligible", "past_cutoff"
+        raise sqlite3.DatabaseError("启动证据不完整，保留原领取待核对")
+    if status in ("admitted", "running"):
+        lease = db.execute("""
+            SELECT claim_id FROM gpu_leases WHERE task_id=? AND released_version IS NULL
+              AND start_confirmed=0 AND execution_evidence='not_started'
+              AND reconciliation_pending=0
+        """, (task_id,)).fetchone()
+        if status != "admitted" or lease is None:
+            raise sqlite3.DatabaseError("无法证实尚未启动，保留原领取待核对")
+        released = db.execute("""
+            UPDATE gpu_leases SET startup_revoked=1,
+                released_version=(SELECT snapshot_version+1 FROM queue_state WHERE id=1)
+            WHERE claim_id=? AND task_id=? AND released_version IS NULL
+              AND start_confirmed=0 AND execution_evidence='not_started'
+              AND reconciliation_pending=0
+        """, (lease[0], task_id)).rowcount
+        if released != 1:
+            raise sqlite3.IntegrityError("取消未能封闭并释放原领取")
+    elif not db.execute(
+        f"SELECT 1 FROM tasks t WHERE t.task_id=? AND {BASE_CANCEL_ELIGIBLE_SQL}", (task_id,)
+    ).fetchone():
+        return "ineligible", None
+    changed = db.execute(
+        "UPDATE tasks SET status='cancelled' WHERE task_id=? AND status=?", (task_id, status)
+    ).rowcount
+    if changed != 1:
+        raise sqlite3.IntegrityError("取消未能更新任务")
+    return "cancelled", None
 
 
 def _transition(
@@ -85,34 +156,65 @@ def _transition(
             (*key, fact.state),
         )
     elif action == "decide" and fact.state == "processing":
-        fact.state = "ineligible"
-        if db.execute(
-            f"SELECT 1 FROM tasks t WHERE t.task_id = ? AND {CANCEL_ELIGIBLE_SQL}", (task_id,)
-        ).fetchone():
-            db.execute("UPDATE tasks SET status='cancelled' WHERE task_id=?", (task_id,))
-            fact.state = "cancelled"
-        db.execute(
+        fact.state, fact.reason = _decide(db, account, task_id)
+        resolved = db.execute(
             """
-            UPDATE cancellation_requests SET state=?,
+            UPDATE cancellation_requests SET state=?, reason=?,
                 resolved_version=(SELECT snapshot_version + 1 FROM queue_state WHERE id=1)
             WHERE owner_id=? AND task_id=? AND request_id=?
         """,
-            (fact.state, *key),
-        )
+            (fact.state, fact.reason, *key),
+        ).rowcount
+        if resolved != 1:
+            raise sqlite3.IntegrityError("取消未能记录原请求终局")
     else:
         return
-    db.execute("UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id=1")
+    if db.execute(
+        "UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id=1"
+    ).rowcount != 1:
+        raise sqlite3.IntegrityError("取消未能推进页面版本")
 
 
 def _advance_once(
     store: "SubmissionStore", account: Account, task_id: str, request_id: str, action: Action
 ) -> CancellationReceipt | None:
-    with closing(store._connect()) as db:
-        db.execute("BEGIN IMMEDIATE")
+    with store.execution_writer() as db:
         if not store.owns_task(db, account, task_id):
             return None
         fact = cancellation_fact(db, account.owner_id, task_id, request_id)
-        _transition(db, account, task_id, fact, action)
+        if action == "decide" and fact.state == "processing":
+            db.execute("SAVEPOINT cancel_decision")
+            try:
+                _transition(db, account, task_id, fact, action)
+            except sqlite3.Error as error:
+                # 实例锁覆盖整个隔离过程，包括 SQLite 提前释放写权后的异常处理。
+                try:
+                    db.execute("ROLLBACK TO cancel_decision")
+                    inserted = db.execute("""
+                        INSERT OR IGNORE INTO cancellation_recovery_blocks VALUES (?, ?, ?)
+                    """, (account.owner_id, task_id, request_id)).rowcount
+                    if not db.execute("""
+                        SELECT 1 FROM cancellation_recovery_blocks
+                        WHERE owner_id=? AND task_id=? AND request_id=?
+                    """, (account.owner_id, task_id, request_id)).fetchone():
+                        raise sqlite3.IntegrityError("无法证实取消恢复阻断记录")
+                    if inserted and db.execute("""
+                        UPDATE queue_state SET snapshot_version=snapshot_version+1 WHERE id=1
+                    """).rowcount != 1:
+                        raise sqlite3.IntegrityError("无法提交取消恢复阻断版本")
+                    db.execute("COMMIT")
+                except sqlite3.Error:
+                    # 全面存储故障不视为成功隔离；进程重启并重新核实前保持关闭。
+                    store.cancellation_storage_failed = True
+                    raise
+                raise CancellationDeferred("取消原请求已隔离，等待服务重试") from error
+            db.execute("RELEASE cancel_decision")
+            db.execute("""
+                DELETE FROM cancellation_recovery_blocks
+                WHERE owner_id=? AND task_id=? AND request_id=?
+            """, (account.owner_id, task_id, request_id))
+        else:
+            _transition(db, account, task_id, fact, action)
         receipt = _receipt(db, task_id, fact)
         try:
             db.execute("COMMIT")
@@ -166,12 +268,17 @@ def cancel(
     return receipt
 
 
-def recover_cancellations(store: "SubmissionStore") -> None:
+def recover_cancellations(store: "SubmissionStore") -> bool:
     with closing(store._connect_readonly()) as db:
         pending = db.execute("""
             SELECT r.owner_id, t.group_id, r.task_id, r.request_id
             FROM cancellation_requests r JOIN tasks t USING (owner_id, task_id)
             WHERE r.state='processing'
         """).fetchall()
+    retry = False
     for owner_id, group_id, task_id, request_id in pending:
-        _advance(store, Account(owner_id, group_id), task_id, request_id, "decide")
+        try:
+            _advance(store, Account(owner_id, group_id), task_id, request_id, "decide")
+        except CancellationDeferred:
+            retry = True
+    return retry

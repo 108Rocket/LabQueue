@@ -6,3 +6,13 @@
 - source_spec: spec-2-1-等待有效观测并按最新快照恢复派发.md
   summary: 统一约定 SQLite 页面版本计数达到整数上限时的行为。
   evidence: 现有任务和输出写入与观测共享整数版本。当 SQLite 整数已达到上限时，继续递增会转为浮点数，浏览器无法将其作为精确十进制版本使用。
+
+# Story 3.2 构建审查续项 · 2026-11-26
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-裁决已领取任务的取消与启动竞争.md`
+  summary: Story 3.3 验证启动事实未知后的启动、派发阻断及完整原卡保留。
+  evidence: 本轮按用户明确范围只验证取消不得封闭或释放；A12 未组合后续启动与派发，须在 3.3 取证。
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-裁决已领取任务的取消与启动竞争.md`
+  summary: Story 3.3 处理未终结取消的未知证据在启动恢复时阻断整个服务的问题。
+  evidence: cancellations._decide 对未知/待核对证据抛 DatabaseError，recover_cancellations 未逐请求处理，app.lifespan 启动恢复会中断并跳过后续请求；完整待核对与恢复验收为用户明确延后范围。
+  resolution: 用户独立复审否决将服务启动中断延期，本轮修复逐请求持久隔离、其他原 ID 恢复及服务端定时重试；故障原租约不封闭不释放。此缺陷不再作为 3.3 待办。3.3 仍负责完整未知执行事实状态机、证据分类、组合故障及恢复/回队验收。
