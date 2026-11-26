@@ -72,7 +72,7 @@ review_loop_iteration: 0
 
 ## 复跑
 
-加载 `scripts/env.ps1` 后执行 `uv run --locked pytest -q`、`node --test tests/submission_page.test.cjs tests/tasks_page.test.cjs`、`uv run --locked ruff check .`、`uv run --locked python scripts/check_env.py` 和 `git diff --check`。2026-11-26 本地全量结果：pytest 144 项通过（含 16 项取消服务测试），Node 45 项通过。Ruff、Python 3.12.15 启动检查和 Git 差异检查通过。pytest 有一条既有的 Starlette/httpx 弃用提示。Sprint 停在 review，等待独立验收。
+加载 `scripts/env.ps1` 后执行 `uv run --locked pytest -q`、`node --test tests/submission_page.test.cjs tests/tasks_page.test.cjs`、`uv run --locked ruff check .`、`uv run --locked python scripts/check_env.py` 和 `git diff --check`。2026-11-26 本地全量结果：pytest 144 项通过（含 16 项取消服务测试），Node 45 项通过。Ruff、Python 3.12.15 启动检查和 Git 差异检查通过。pytest 有一条既有的 Starlette/httpx 弃用提示。实现提交时 Sprint 进入 review。
 
 ### 本地双卡模拟验收证据
 
@@ -86,6 +86,16 @@ review_loop_iteration: 0
 | 两页共享版本、超时、乱序及入口恢复 | 超时后普通刷新仅发送 GET。查无记录时显示未知；收到封存回执时仍关闭入口。匹配 ID 的完整快照同时证明已封存及当前可取消后，确认操作才生成新 ID。其他请求回执和迟到的旧快照均无法重开入口。 | [任务页面测试](../../tests/tasks_page.test.cjs) |
 
 额外在本地 Chrome 的同一合成账号下提交 A、B，从 A 的详情确认取消，返回列表看到 A「已取消」、B「全局队位 1」。
+
+### 2026-11-26 独立复审与收尾
+
+**独立复审通过。** 复审范围为 `59f88e5..29cff47`，被审提交为 `29cff47d62b484be37026dcb866f4a16e5b9882d`。四个独立审查层对照故事卡、AD-4、AD-7、D-010 和 D-011，均未发现 Story 3.1 范围内的合并阻塞。故事卡与 Sprint 状态统一为 `done`。
+
+- **全量回归**　pytest 144/144、Node 45/45 通过。Ruff、本地启动检查及 Git 差异空白检查通过。pytest 仅有既有的 Starlette/httpx 弃用提示。
+- **临时取消入口测试 8/8 通过**　Node 页面夹具中，版本达标、字段完整、原 ID 匹配且任务仍可取消时，旧请求已封存或已有未能取消的终局，均可恢复入口。另六项分别输入低版本、未知、处理中、任务已不可取消、ID 错配及快照缺字段，入口均保持关闭。八项核对均只发 GET。
+- **临时独立进程重启场景 3/3 通过**　每项均用全新 Python 进程打开原 SQLite 库。① 封存后迟到并重放的旧 ID 仍为 `sealed`，任务、请求、租约、启动事件和版本均无变化。② 已受理且仍在排队时，服务端恢复原 ID，仅产生一个取消终局。③ 已受理但裁决前已被领取时，原 ID 终局为 `ineligible`，任务仍为 `admitted`，原租约逐字段不变。
+
+以上 8 项和 3 项是独立复审时的补充验证，单独计数。复审限于本地模拟。取消和封存文案仍待 UX 人工复核。
 
 ### 待联调
 
