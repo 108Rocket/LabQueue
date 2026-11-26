@@ -132,7 +132,9 @@ function taskCard(task, outputId) {
   const queued = task.status === "queued";
   const status = document.createElement("p");
   if (queued) status.textContent = `排队中 · 全局队位 ${task.queue_position}`;
-  else status.textContent = task.status === "admitted" ? "已获准" : "已离开队列";
+  else if (task.status === "admitted") status.textContent = "已获准";
+  else if (task.status === "running") status.textContent = "运行中";
+  else status.textContent = "已离开队列";
   card.append(heading, status);
   if (queued) {
     const reason = document.createElement("p");

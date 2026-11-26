@@ -1,4 +1,4 @@
-"""任务提交、模拟领取、幂等重放和只读核对。"""
+"""任务提交、模拟领取与启动、幂等重放和只读核对。"""
 
 import sqlite3
 from contextlib import closing
@@ -26,7 +26,15 @@ from labqueue.observations import (
     WaitingReason,
     initialize_observations,
     read_admission,
-    read_admission_for_claim,
+    read_admission_for_dispatch,
+)
+from labqueue.starts import (
+    StartCommitUnknown,
+    StartConfirmed,
+    StartResult,
+    decide_start,
+    initialize_starts,
+    read_start,
 )
 from labqueue.storage import prepare_storage, rollback_open_transaction, verify_storage
 
@@ -166,6 +174,7 @@ class SubmissionStore:
                 END;
                 """)
             initialize_leases(db)
+            initialize_starts(db)
             publisher = SimulatedObservations(
                 self._connect, self._connect_readonly, *initialize_observations(db)
             )
@@ -186,7 +195,7 @@ class SubmissionStore:
         with closing(self._connect()) as db:
             db.execute("BEGIN IMMEDIATE")
             try:
-                admission = read_admission_for_claim(db)
+                admission = read_admission_for_dispatch(db)
                 options = dispatch_options(db, admission)
                 if options.head_task_id is None:
                     result = ClaimBlocked("queue_empty")
@@ -219,6 +228,47 @@ class SubmissionStore:
             if committed is not None and committed == result:
                 return committed
         raise ClaimCommitUnknown(claim_id) from commit_error
+
+    def confirm_start(
+        self, executor: Account, *, task_id: str, claim_id: str, gpu_uuid: str
+    ) -> StartResult:
+        """仅供应用进程内受信任的本地模拟执行方调用。"""
+        try:
+            return self._confirm_start(executor, task_id, claim_id, gpu_uuid)
+        except sqlite3.OperationalError as error:
+            if getattr(error, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_BUSY:
+                raise
+            return self._confirm_start(executor, task_id, claim_id, gpu_uuid)
+
+    def _confirm_start(
+        self, executor: Account, task_id: str, claim_id: str, gpu_uuid: str
+    ) -> StartResult:
+        with closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                result = decide_start(db, executor, task_id, claim_id, gpu_uuid)
+            except BaseException:
+                rollback_open_transaction(db)
+                raise
+
+            try:
+                db.execute("COMMIT")
+            except sqlite3.Error as error:
+                if rollback_open_transaction(db):
+                    raise
+                commit_error = error
+            else:
+                return result
+
+        if isinstance(result, StartConfirmed):
+            try:
+                with closing(self._connect_readonly()) as db:
+                    committed = read_start(db, task_id)
+            except (sqlite3.Error, OSError) as error:
+                raise StartCommitUnknown("无法读取模拟启动确认") from error
+            if committed is not None and committed == result:
+                return committed
+        raise StartCommitUnknown("无法证实模拟启动已提交") from commit_error
 
     def list_tasks(self, account: Account) -> TaskListSnapshot:
         version, tasks, _ = self._task_snapshot(account, task_id=None)

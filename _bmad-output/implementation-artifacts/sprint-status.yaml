@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-22-2026 10:31
-last_updated: 11-26-2026 12:19
+last_updated: 11-26-2026 12:52
 project: LabQueue
 project_key: NOKEY
 tracking_system: file-system
@@ -44,7 +44,7 @@ development_status:
   epic-2: in-progress
   2-1-等待有效观测并按最新快照恢复派发: done
   2-2-原子领取队首和单卡租约: done
-  2-3-让一次启动确认只产生一次模拟启动: backlog
+  2-3-让一次启动确认只产生一次模拟启动: review
   2-4-查看完成或失败并释放租约: backlog
   epic-2-retrospective: optional
 
