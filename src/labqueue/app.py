@@ -1,5 +1,6 @@
 """LabQueue 的本地模拟应用。"""
 
+import asyncio
 import json
 import secrets
 import sqlite3
@@ -9,16 +10,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import UUID4, BaseModel, ConfigDict, StringConstraints
+from pydantic import UUID4, BaseModel, ConfigDict, StringConstraints, TypeAdapter, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from labqueue.auth import SESSION_COOKIE, SESSION_SECONDS, VIEW_SCOPE_COOKIE, DemoSessions, Session
+from labqueue.cancellations import CancellationReceipt, cancel, recover_cancellations
 from labqueue.storage import default_database
 from labqueue.submissions import (
     CommitUncertain,
@@ -32,6 +34,7 @@ from labqueue.submissions import (
 )
 
 PACKAGE_DIR = Path(__file__).parent
+PENDING_PAIR = TypeAdapter(tuple[UUID4, UUID4])
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
 FIELD_ERRORS = {
     "username": "请输入合成账号。",
@@ -105,11 +108,35 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         ):
             raise RuntimeError("检测到旧任务库，请先停服并将 SQLite 备份迁入账号私有目录")
         app.state.observations = store.initialize()
+        recover_cancellations(store)
         app.state.claim_head = store.claim_head
         app.state.report_end = store.report_end
         app.state.confirm_start = store.confirm_start
         app.state.sessions = DemoSessions()
-        yield
+        requested = asyncio.Event()
+        stopping = False
+        loop = asyncio.get_running_loop()
+        app.state.wake_recovery = lambda: loop.call_soon_threadsafe(requested.set)
+
+        async def retry_pending() -> None:
+            while True:
+                await requested.wait()
+                if stopping:
+                    return
+                requested.clear()
+                try:
+                    await asyncio.to_thread(recover_cancellations, store)
+                except sqlite3.Error:
+                    await asyncio.sleep(0.5)
+                    requested.set()
+
+        worker = asyncio.create_task(retry_pending())
+        try:
+            yield
+        finally:
+            stopping = True
+            requested.set()
+            await worker
 
     app = FastAPI(title="LabQueue", version="0.1.0", lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
@@ -150,7 +177,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
 
     @app.get("/tasks/{task_id}", response_class=HTMLResponse, include_in_schema=False)
     def task_page(request: Request, task_id: str) -> HTMLResponse:
-        return page(request, task_view=True, task_id=task_id)
+        return page(request, task_view=True, task_id=task_id.lower())
 
     @app.get("/health")
     def health() -> dict[str, str | bool]:
@@ -229,18 +256,29 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         return receipt
 
     @app.get("/api/tasks")
-    def list_tasks(session: Annotated[Session, Depends(read_session)]) -> TaskListSnapshot:
+    def list_tasks(
+        session: Annotated[Session, Depends(read_session)],
+        pending: Annotated[list[str] | None, Query()] = None,
+    ) -> TaskListSnapshot:
         try:
-            return store.list_tasks(session.account)
+            pairs = [PENDING_PAIR.validate_python(entry.split(".")) for entry in pending or []]
+        except ValidationError:
+            raise HTTPException(422, "待核对标识格式无效。") from None
+        try:
+            return store.list_tasks(session.account, {str(task): str(key) for task, key in pairs})
         except sqlite3.Error:
             raise HTTPException(503, "暂时无法读取任务，请刷新。") from None
 
     @app.get("/api/tasks/{task_id}", response_model=TaskDetailSnapshot)
     def task_detail(
-        task_id: str, session: Annotated[Session, Depends(read_session)]
+        task_id: str,
+        session: Annotated[Session, Depends(read_session)],
+        request_id: UUID4 | None = None,
     ) -> TaskDetailSnapshot | JSONResponse:
         try:
-            version, snapshot = store.task_detail(session.account, task_id)
+            version, snapshot = store.task_detail(
+                session.account, task_id.lower(), str(request_id) if request_id else None
+            )
         except sqlite3.Error:
             raise HTTPException(503, "暂时无法读取任务，请刷新。") from None
         if snapshot is None:
@@ -248,6 +286,30 @@ def create_app(database_path: Path | None = None) -> FastAPI:
                 {"detail": "未找到该任务。", "snapshot_version": version}, status_code=404
             )
         return snapshot
+
+    def cancellation_command(
+        session: Session, task_id: UUID4, request_id: UUID4, *, seal: bool = False
+    ) -> CancellationReceipt:
+        try:
+            receipt = cancel(store, session.account, str(task_id), str(request_id), seal=seal)
+        except sqlite3.Error:
+            app.state.wake_recovery()
+            raise HTTPException(503, "取消请求结果待核对，请刷新任务。") from None
+        if receipt is None:
+            raise HTTPException(404, "未找到该任务。")
+        return receipt
+
+    @app.post("/api/tasks/{task_id}/cancellations/{request_id}")
+    def cancel_task(
+        task_id: UUID4, request_id: UUID4, session: Annotated[Session, Depends(require_csrf)]
+    ) -> CancellationReceipt:
+        return cancellation_command(session, task_id, request_id)
+
+    @app.post("/api/tasks/{task_id}/cancellations/{request_id}/seal")
+    def seal_request(
+        task_id: UUID4, request_id: UUID4, session: Annotated[Session, Depends(require_csrf)]
+    ) -> CancellationReceipt:
+        return cancellation_command(session, task_id, request_id, seal=True)
 
     @app.get("/api/tasks/{task_id}/outputs/{output_id}")
     def task_output(

@@ -40,6 +40,8 @@ def main() -> None:
             ("post", "/api/session"),
             ("delete", "/api/session"),
             ("post", "/api/submissions"),
+            ("post", "/api/tasks/{task_id}/cancellations/{request_id}"),
+            ("post", "/api/tasks/{task_id}/cancellations/{request_id}/seal"),
         }
         if writable != expected:
             raise RuntimeError(f"Unexpected writable API routes: {writable ^ expected}")

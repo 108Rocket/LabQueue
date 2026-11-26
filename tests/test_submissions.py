@@ -1037,7 +1037,7 @@ def test_cross_group_positions_follow_commit_order_after_reverse_receipts_and_re
             task, = snapshot["tasks"]
             assert (task["task_id"], task["enqueue_seq"]) == (receipt["task_id"], str(position))
             assert (task["queue_position"], task["waiting_reason"], task["can_cancel"]) == (
-                position, "gpu_busy", False
+                position, "gpu_busy", True
             )
             detail = actor.get(f"/api/tasks/{receipt['task_id']}", headers=headers).json()
             assert detail == {"snapshot_version": "3", "task": task}
@@ -1232,7 +1232,6 @@ def test_cancel_authorization_with_transactional_test_double(database):
             db.execute("CREATE TABLE test_leases (gpu_id TEXT, task_id TEXT)")
             db.execute("INSERT INTO test_leases VALUES ('synthetic-gpu-1', ?)", (task_id,))
         path = f"/_test/cancel/{task_id}"
-        assert client.post(f"/api/tasks/{task_id}/cancel", headers=owner).status_code == 404
         before = state(database), leases()
         assert client.post(path).status_code == 403
         assert client.post(path, headers={"X-CSRF-Token": "wrong"}).status_code == 403

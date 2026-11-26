@@ -69,6 +69,7 @@ function makePage(detail, shared = makeSharedVersionStore(), scope = "test-sessi
   elements.get("tasks-page").dataset.snapshotScope = scope;
   if (detail) elements.get("tasks-page").dataset.taskId = taskId;
   const pageWindow = makeElement("window");
+  pageWindow.confirm = () => true;
   pageWindow.location = { reload() {} };
   let checkInterval;
   pageWindow.setInterval = (callback) => { checkInterval = callback; };
@@ -87,13 +88,14 @@ function makePage(detail, shared = makeSharedVersionStore(), scope = "test-sessi
     navigator: { locks: shared.locks },
     localStorage: {
       getItem(key) {
-        assert.ok(shared.heldLocks.has(key));
+        if (!key.startsWith("labqueue.cancel-requests.")) assert.ok(shared.heldLocks.has(key));
         if (!shared.available) throw new Error("storage unavailable");
         return shared.values.get(key) ?? null;
       },
       setItem(key, value) {
         if (key === "labqueue.session-change") return shared.signal(pageWindow, key);
-        assert.ok(shared.heldLocks.has(key));
+        assert.ok(shared.heldLocks.has(key.startsWith("labqueue.cancel-requests.")
+          ? `labqueue.task-version.${scope}` : key));
         if (!shared.available) throw new Error("storage unavailable");
         shared.values.set(key, value);
       },
@@ -122,6 +124,9 @@ function makePage(detail, shared = makeSharedVersionStore(), scope = "test-sessi
     logout: () => elements.get("logout").fire("click"),
     readOutput: () => elements.get("task-results").children[0].children[0].children
       .find((child) => child.tag === "button").fire("click"),
+    button: (label) => elements.get("task-results").children[0]?.children[0]?.children
+      .find((child) => child.tag === "button" && child.textContent === label),
+    confirmWith: (callback) => { pageWindow.confirm = callback; },
     fire: (event, fields) => pageWindow.fire(event, fields),
     checkSession: () => checkInterval(),
     fetches,
@@ -269,7 +274,7 @@ for (const detail of [false, true]) {
       { ...good, snapshot_version: 10 },
       { ...good, snapshot_version: "10\n" },
       snapshot(detail, "10", { waiting_reason: undefined }),
-      snapshot(detail, "10", { can_cancel: true }),
+      snapshot(detail, "10", { can_cancel: "true" }),
       snapshot(detail, "10", { failure_reason: "oom" }),
       snapshot(detail, "10", {
         status: "failed", queue_position: null, waiting_reason: null, failure_reason: 3,
@@ -635,7 +640,6 @@ test("读取失败时保留画面，并提示浏览器版本协调所需能力",
 
   shared.available = false;
   const unverified = detail.refresh();
-  detail.reply(2, snapshot(true, "3", { queue_position: 1 }));
   await unverified;
   assert.equal(detail.rows(), before);
   assert.match(detail.feedback(), /上次确认。请允许访问浏览器本地存储/);
@@ -715,3 +719,170 @@ for (const detail of [false, true]) {
     });
   }
 }
+
+test("跨页核对未知、主动封存、完整快照恢复入口，旧回执不能替换新请求", async () => {
+  const shared = makeSharedVersionStore();
+  const detail = makePage(true, shared);
+  const list = makePage(false, shared);
+  const queued = (view, version, fact) => snapshot(view, version, {
+    can_cancel: true, ...(fact && { cancellation: fact }),
+  });
+  detail.reply(0, queued(true, "3"));
+  list.reply(0, queued(false, "3"));
+  await settle();
+  const oldCommand = detail.button("取消任务").fire("click");
+  await settle();
+  const old = detail.fetches[1];
+  const id = old.path.split("/").at(-1);
+  const fact = (state) => ({ request_id: id, state });
+  const receipt = (version, state) => ({
+    task_id: taskId, snapshot_version: version, ...fact(state),
+  });
+  assert.equal(old.method, "POST");
+  assert.doesNotMatch(detail.rows(), /已取消/);
+  const reopened = makePage(true, shared);
+  assert.equal(reopened.fetches[0].path, `/api/tasks/${taskId}?request_id=${id}`);
+  reopened.reply(0, queued(true, "3", fact("unknown")));
+  await settle();
+  assert.equal(reopened.button("取消任务"), undefined);
+  assert.match(reopened.rows(), /取消结果未知/);
+  reopened.confirmWith((message) => {
+    assert.match(message, /未受理.*封存.*已受理/);
+    return false;
+  });
+  await reopened.button("核对并封存旧取消请求").fire("click");
+  assert.equal(reopened.fetches.length, 1);
+  reopened.confirmWith(() => true);
+  const read = list.refresh();
+  assert.equal(list.fetches[1].path, `/api/tasks?pending=${taskId}.${id}`);
+  list.reply(1, queued(false, "3", fact("unknown")));
+  await read;
+  assert.match(list.rows(), /取消结果未知/);
+  assert.ok(list.fetches.every((req) => req.method === "GET"));
+
+  const seal = reopened.button("核对并封存旧取消请求").fire("click");
+  await settle();
+  assert.equal(reopened.fetches[1].path, old.path + "/seal");
+  reopened.reply(1, receipt("4", "sealed"));
+  await settle();
+  assert.equal(shared.values.get(versionKey), "4");
+  assert.equal(reopened.button("取消任务"), undefined);
+  assert.match(reopened.rows(), /全局队位 2/);
+  reopened.reply(2, queued(true, "4", fact("sealed")));
+  await seal;
+  reopened.confirmWith((message) => { assert.ok(message.includes(task.name)); return false; });
+  await reopened.button("取消任务").fire("click");
+  assert.equal(reopened.fetches.length, 3);
+  assert.equal(JSON.parse(shared.values.get("labqueue.cancel-requests.test-session"))[taskId], id);
+  reopened.confirmWith(() => true);
+  const next = reopened.button("取消任务").fire("click");
+  await settle();
+  const nextId = reopened.fetches[3].path.split("/").at(-1);
+  assert.notEqual(nextId, id);
+  old.reply(receipt("80", "sealed"));
+  await oldCommand;
+  assert.equal(shared.values.get(versionKey), "4");
+  assert.equal(detail.fetches.length, 2);
+  assert.ok(reopened.button("取消任务").disabled);
+  reopened.fetches[3].interrupt();
+  await next;
+  assert.doesNotMatch(reopened.rows(), /已取消/);
+  assert.ok(reopened.button("取消任务").disabled);
+  const reconcile = reopened.refresh();
+  assert.equal(reopened.fetches[4].method, "GET");
+  assert.match(reopened.fetches[4].path, new RegExp(nextId));
+  reopened.reply(4, queued(true, "4", { request_id: nextId, state: "unknown" }));
+  await reconcile;
+  assert.equal(reopened.button("取消任务"), undefined);
+});
+
+test("取消回执提高共享版本下限，列表和详情仅从完整快照显示已取消", async () => {
+  const shared = makeSharedVersionStore();
+  const detail = makePage(true, shared);
+  const list = makePage(false, shared);
+  detail.reply(0, snapshot(true, "2", { can_cancel: true }));
+  list.reply(0, snapshot(false, "2", { can_cancel: true }));
+  await settle();
+  const late = list.refresh();
+  const click = detail.button("取消任务").fire("click");
+  await settle();
+  const request_id = detail.fetches[1].path.split("/").at(-1);
+  const cancellation = { request_id, state: "cancelled" };
+  detail.reply(1, { task_id: taskId, snapshot_version: "4", ...cancellation });
+  await settle();
+  assert.match(detail.rows(), /全局队位 2/);
+  assert.doesNotMatch(detail.rows(), /已取消/);
+  list.reply(1, snapshot(false, "3", { can_cancel: true, queue_position: 1 }));
+  await late;
+  assert.match(list.rows(), /全局队位 2/);
+  assert.match(list.feedback(), /上次确认/);
+  const done = { status: "cancelled", queue_position: null, waiting_reason: null,
+    can_cancel: false, cancellation };
+  detail.reply(2, snapshot(true, "4", done));
+  await click;
+  const read = list.refresh();
+  assert.equal(list.fetches[2].path, "/api/tasks");
+  list.reply(2, snapshot(false, "4", { ...done, cancellation: undefined }));
+  await read;
+  for (const page of [list, detail]) {
+    assert.match(page.rows(), /已取消/);
+    assert.doesNotMatch(page.rows(), /全局队位|取消任务/);
+  }
+});
+
+test("打开的详情响应待核对键变化，错配快照推进版本，迟到的匹配回执仍触发只读核对", async () => {
+  const shared = makeSharedVersionStore();
+  const page = makePage(true, shared);
+  const other = makePage(true, shared);
+  const pendingKey = "labqueue.cancel-requests.test-session";
+  for (const tab of [page, other]) tab.reply(0, snapshot(true, "1", { can_cancel: true }));
+  await settle();
+  page.confirmWith((message) => { assert.ok(message.includes(task.name)); return false; });
+  await page.button("取消任务").fire("click");
+  assert.equal(page.fetches.length, 1);
+  assert.ok(!shared.values.has(pendingKey));
+
+  const delayed = other.refresh();
+  page.confirmWith(() => true);
+  const click = page.button("取消任务").fire("click");
+  await settle();
+  const id = JSON.parse(shared.values.get(pendingKey))[taskId];
+  const storageRead = other.fire("storage", { key: pendingKey });
+  assert.ok(other.button("取消任务").disabled);
+  assert.equal(other.fetches[2].path, `/api/tasks/${taskId}?request_id=${id}`);
+  other.reply(1, snapshot(true, "7", { can_cancel: true, queue_position: 1 }));
+  await delayed;
+  assert.equal(shared.values.get(versionKey), "7");
+  assert.match(other.rows(), /全局队位 2/);
+  assert.match(other.feedback(), /上次确认/);
+
+  const processing = { request_id: id, state: "processing" };
+  other.reply(2, snapshot(true, "6", { cancellation: processing }));
+  await storageRead;
+  page.reply(1, { ...processing, task_id: taskId, snapshot_version: "5" });
+  await settle();
+  assert.equal(shared.values.get(versionKey), "7");
+  assert.equal(page.fetches[2].method, "GET");
+  page.reply(2, snapshot(true, "7", { cancellation: processing }));
+  await click;
+  assert.match(page.rows(), /正在处理/);
+  assert.equal(page.button("取消任务"), undefined);
+});
+
+test("只从匹配的终态完整快照清除已封存或已终结的跟踪", async () => {
+  const pendingKey = "labqueue.cancel-requests.test-session";
+  const request_id = "0bd4e56f-5f82-4ff6-a75d-d24fe13c8a59";
+  for (const state of ["unknown", "processing", "sealed", "ineligible"]) {
+    for (const status of ["completed", "failed"]) {
+      const shared = makeSharedVersionStore();
+      shared.values.set(pendingKey, JSON.stringify({ [taskId]: request_id }));
+      const page = makePage(true, shared);
+      page.reply(0, snapshot(true, "9", { status, queue_position: null, waiting_reason: null,
+        cancellation: { request_id, state } }));
+      await settle();
+      assert.equal(JSON.parse(shared.values.get(pendingKey))[taskId],
+        ["unknown", "processing"].includes(state) ? request_id : undefined);
+      assert.equal(page.button("取消任务"), undefined);
+    }
+  }
+});

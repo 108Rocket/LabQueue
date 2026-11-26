@@ -1,5 +1,6 @@
 """任务提交、模拟领取与启动、幂等重放和只读核对。"""
 
+import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
@@ -11,6 +12,11 @@ from uuid import UUID, uuid4
 from pydantic import UUID4, BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 from labqueue.auth import Account
+from labqueue.cancellations import (
+    CANCEL_ELIGIBLE_SQL,
+    CancellationFact,
+    initialize_cancellations,
+)
 from labqueue.leases import (
     ClaimBlocked,
     ClaimCommitUnknown,
@@ -83,7 +89,8 @@ class TaskView(BaseModel):
     queue_position: int | None
     waiting_reason: WaitingReason | Literal["requeue_required"] | None
     failure_reason: Literal["oom"] | None = Field(default=None, exclude_if=lambda v: v is None)
-    can_cancel: Literal[False] = False
+    can_cancel: bool
+    cancellation: CancellationFact | None = Field(default=None, exclude_if=lambda v: v is None)
 
 
 class TaskListSnapshot(BaseModel):
@@ -186,6 +193,7 @@ class SubmissionStore:
             initialize_leases(db)
             initialize_starts(db)
             initialize_results(db)
+            initialize_cancellations(db)
             publisher = SimulatedObservations(
                 self._connect, self._connect_readonly, *initialize_observations(db)
             )
@@ -317,12 +325,17 @@ class SubmissionStore:
                 return result
         raise EndCommitUnknown("无法证实模拟终态已提交") from commit_error
 
-    def list_tasks(self, account: Account) -> TaskListSnapshot:
-        version, tasks, _ = self._task_snapshot(account, task_id=None)
+    def list_tasks(
+        self, account: Account, pending: dict[str, str] | None = None
+    ) -> TaskListSnapshot:
+        version, tasks, _ = self._task_snapshot(account, None, pending or {})
         return TaskListSnapshot(snapshot_version=version, tasks=tasks)
 
-    def task_detail(self, account: Account, task_id: str) -> tuple[str, TaskDetailSnapshot | None]:
-        version, tasks, output_id = self._task_snapshot(account, task_id)
+    def task_detail(
+        self, account: Account, task_id: str, request_id: str | None = None
+    ) -> tuple[str, TaskDetailSnapshot | None]:
+        pending = {task_id: request_id} if request_id else {}
+        version, tasks, output_id = self._task_snapshot(account, task_id, pending)
         if not tasks:
             return version, None
         return version, TaskDetailSnapshot(
@@ -332,10 +345,13 @@ class SubmissionStore:
     @staticmethod
     def owns_task(db: sqlite3.Connection, account: Account, task_id: str) -> bool:
         """在调用者持有的事务内检查可信所有者。"""
-        return db.execute(
-            "SELECT 1 FROM tasks WHERE task_id = ? AND owner_id = ?",
-            (task_id, account.owner_id),
-        ).fetchone() is not None
+        return (
+            db.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ? AND owner_id = ?",
+                (task_id, account.owner_id),
+            ).fetchone()
+            is not None
+        )
 
     def read_task_output(self, account: Account, task_id: str, output_id: str) -> TaskOutput | None:
         with closing(self._connect()) as db:
@@ -350,7 +366,7 @@ class SubmissionStore:
         return TaskOutput(text=row["text"]) if row is not None else None
 
     def _task_snapshot(
-        self, account: Account, task_id: str | None
+        self, account: Account, task_id: str | None, pending: dict[str, str]
     ) -> tuple[str, list[TaskView], str | None]:
         output_id = None
         with closing(self._connect()) as db:
@@ -363,13 +379,14 @@ class SubmissionStore:
             reason = dispatch_options(db, read_admission(db)).waiting_reason
             if task_id is None:
                 rows = db.execute(
-                    """WITH ranked AS (
+                    f"""WITH ranked AS (
                            SELECT task_id,
                                   row_number() OVER (ORDER BY enqueue_seq) AS queue_position
                            FROM tasks WHERE status = 'queued'
                        )
                        SELECT t.task_id, t.name, t.enqueue_seq, t.queued_at, t.status,
-                              ranked.queue_position, r.outcome
+                              ranked.queue_position, r.outcome,
+                              ({CANCEL_ELIGIBLE_SQL}) AS can_cancel
                        FROM tasks AS t LEFT JOIN ranked ON ranked.task_id = t.task_id
                        LEFT JOIN simulated_results r ON r.task_id = t.task_id
                        WHERE t.owner_id = ? ORDER BY t.enqueue_seq""",
@@ -377,8 +394,8 @@ class SubmissionStore:
                 ).fetchall()
             elif self.owns_task(db, account, task_id):
                 rows = db.execute(
-                    """SELECT t.task_id, t.name, t.enqueue_seq, t.queued_at, t.status,
-                              output.output_id, r.outcome,
+                    f"""SELECT t.task_id, t.name, t.enqueue_seq, t.queued_at, t.status,
+                              output.output_id, r.outcome, ({CANCEL_ELIGIBLE_SQL}) AS can_cancel,
                               CASE WHEN t.status = 'queued' THEN (
                                   SELECT count(*) + 1 FROM tasks AS earlier
                                   WHERE earlier.status = 'queued'
@@ -392,19 +409,29 @@ class SubmissionStore:
                 output_id = rows[0]["output_id"]
             else:
                 rows = []
-        tasks = [
-            TaskView(
-                task_id=row["task_id"],
-                name=row["name"],
-                enqueue_seq=str(row["enqueue_seq"]),
-                queued_at=row["queued_at"],
-                status=row["status"],
-                failure_reason="oom" if row["outcome"] == "oom" else None,
-                queue_position=row["queue_position"],
-                waiting_reason=reason if row["status"] == "queued" else None,
-            )
-            for row in rows
-        ]
+            facts = {}
+            if pending and rows:
+                for key, request_id, state in db.execute("""
+                    SELECT p.key, p.value, coalesce(r.state, 'unknown')
+                    FROM json_each(?) p LEFT JOIN cancellation_requests r
+                      ON r.owner_id=? AND r.task_id=p.key AND r.request_id=p.value
+                """, (json.dumps(pending), account.owner_id)):
+                    facts[key] = CancellationFact(request_id=request_id, state=state)
+            tasks = [
+                TaskView(
+                    task_id=row["task_id"],
+                    name=row["name"],
+                    enqueue_seq=str(row["enqueue_seq"]),
+                    queued_at=row["queued_at"],
+                    status=row["status"],
+                    failure_reason="oom" if row["outcome"] == "oom" else None,
+                    queue_position=row["queue_position"],
+                    waiting_reason=reason if row["status"] == "queued" else None,
+                    can_cancel=row["can_cancel"],
+                    cancellation=facts.get(row["task_id"]),
+                )
+                for row in rows
+            ]
         return str(version), tasks, output_id
 
     @staticmethod
