@@ -3,6 +3,14 @@ const detailId = taskPage.dataset.taskId;
 const taskPath = detailId ? `/api/tasks/${encodeURIComponent(detailId)}` : "/api/tasks";
 const snapshotScope = taskPage.dataset.snapshotScope;
 const versionKey = `labqueue.task-version.${snapshotScope}`;
+const pendingKey = `labqueue.cancel-requests.${snapshotScope}`;
+const cancelLabels = {
+  unknown: "取消结果未知，可刷新核对或主动封存旧请求。",
+  processing: "取消请求已受理，正在处理。",
+  sealed: "旧取消请求已封存。",
+  ineligible: "该请求未能取消任务。",
+  cancelled: "取消请求已生效。",
+};
 const taskFeedback = byId("tasks-feedback");
 const taskResults = byId("task-results");
 const refreshButton = byId("refresh-tasks");
@@ -25,6 +33,8 @@ let sessionValid = true;
 let sessionCheck = null;
 let pageSuspended = false;
 let readEpoch = 0;
+let actionButton = null;
+let displayedPending = "";
 
 class VersionCoordinationError extends Error {}
 
@@ -46,7 +56,9 @@ function isTaskView(task) {
       || typeof task.status !== "string" || !task.status.trim()
       || (task.failure_reason !== undefined
           && (task.status !== "failed" || task.failure_reason !== "oom"))
-      || task.can_cancel !== false) {
+      || typeof task.can_cancel !== "boolean" || (task.can_cancel && task.status !== "queued")
+      || (task.cancellation !== undefined && (!taskUuid.test(task.cancellation?.request_id)
+          || !Object.hasOwn(cancelLabels, task.cancellation?.state)))) {
     return false;
   }
   if (task.status === "queued") {
@@ -88,7 +100,19 @@ function checkTaskSession() {
 }
 
 function markLastConfirmed(message) {
+  if (actionButton) actionButton.disabled = true;
   taskFeedback.textContent = displayedVersion === null ? message : `上次确认。${message}`;
+}
+
+function pendingRequests() {
+  return accessVersionStorage(() => {
+    const entries = JSON.parse(localStorage.getItem(pendingKey) || "{}");
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)
+        || Object.entries(entries).some(([task, id]) => !taskUuid.test(task) || !taskUuid.test(id))) {
+      throw new Error("Invalid cancellation tracking data");
+    }
+    return entries;
+  });
 }
 
 function accessVersionStorage(operation) {
@@ -137,6 +161,7 @@ function taskCard(task, outputId) {
   else if (task.status === "admitted") status.textContent = "已获准";
   else if (task.status === "running") status.textContent = "运行中";
   else if (task.status === "completed") status.textContent = "已完成";
+  else if (task.status === "cancelled") status.textContent = "已取消";
   else if (task.status === "failed") {
     status.textContent = task.failure_reason === "oom"
       ? "失败 · GPU 显存不足（OOM）" : "失败 · 模拟执行方未提供具体原因";
@@ -152,8 +177,71 @@ function taskCard(task, outputId) {
   const confirmation = `确认时间 ${confirmedAt}`;
   registration.textContent = detailId ? `入队序号 ${task.enqueue_seq} · ${confirmation}` : confirmation;
   card.append(registration);
+  if (task.cancellation) {
+    const notice = document.createElement("p");
+    notice.textContent = cancelLabels[task.cancellation.state];
+    card.append(notice);
+  }
+  if (detailId) addCancelControl(card, task);
   if (outputId) addOutputControl(card, outputId);
   return card;
+}
+
+function addCancelControl(card, task) {
+  const fact = task.cancellation;
+  const seal = fact?.state === "unknown";
+  if (!seal && (!task.can_cancel || (fact && !["sealed", "ineligible"].includes(fact.state)))) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = seal ? "核对并封存旧取消请求" : "取消任务";
+  card.append(button);
+  actionButton = button;
+  button.addEventListener("click", async () => {
+    if (button.disabled || taskResults.hidden || !checkTaskSession()) return;
+    const prompt = seal
+      ? `核对「${task.name}」的旧取消请求？未受理的请求将被封存；已受理的请求会保留处理结果或继续处理。`
+      : `确认取消排队任务「${task.name}」？`;
+    if (!window.confirm(prompt)) return;
+    const epoch = readEpoch;
+    let id;
+    try {
+      await withVersionFloor(() => {
+        if (button.disabled || !taskResults.contains(card) || epoch !== readEpoch) return;
+        const pending = pendingRequests();
+        if (pending[detailId] !== fact?.request_id) {
+          markLastConfirmed("取消请求已变化，请刷新核对。");
+          return;
+        }
+        id = seal ? fact.request_id : crypto.randomUUID();
+        pending[detailId] = id;
+        accessVersionStorage(() => localStorage.setItem(pendingKey, JSON.stringify(pending)));
+        button.disabled = true;
+        taskFeedback.textContent = "正在核对取消请求。";
+      });
+      if (!id || epoch !== readEpoch || !checkTaskSession()) return;
+      const receipt = await request(`${taskPath}/cancellations/${id}${seal ? "/seal" : ""}`, {
+        method: "POST", headers: sessionHeaders,
+      });
+      let matched = false;
+      await withVersionFloor(() => {
+        if (epoch !== readEpoch || pendingRequests()[detailId] !== id
+            || receipt?.request_id !== id || receipt.task_id !== detailId
+            || !Object.hasOwn(cancelLabels, receipt.state) || !isDecimal(receipt.snapshot_version)) return;
+        if (earlierVersion(versionFloor, receipt.snapshot_version)) {
+          accessVersionStorage(() => localStorage.setItem(versionKey, receipt.snapshot_version));
+          versionFloor = receipt.snapshot_version;
+        }
+        markLastConfirmed("已收到取消回执，正在核对完整任务。");
+        matched = true;
+      });
+      if (matched) await refreshTasks();
+    } catch (error) {
+      if (error.status === 401 || error.status === 403) invalidateTaskSession();
+      else if (epoch === readEpoch && checkTaskSession() && taskResults.contains(card)) {
+        markLastConfirmed("取消结果尚待核对，请刷新此页。");
+      }
+    }
+  });
 }
 
 function addOutputControl(card, outputId) {
@@ -192,7 +280,11 @@ function addOutputControl(card, outputId) {
 
 async function readTasks() {
   try {
-    const snapshot = await request(taskPath, { headers: sessionHeaders });
+    const pending = pendingRequests();
+    const query = detailId
+      ? (pending[detailId] ? `request_id=${pending[detailId]}` : "")
+      : Object.entries(pending).map(([task, id]) => `pending=${task}.${id}`).join("&");
+    const snapshot = await request(query ? `${taskPath}?${query}` : taskPath, { headers: sessionHeaders });
     return {
       version: snapshot.snapshot_version, tasks: readTaskRows(snapshot),
       outputId: detailId ? snapshot.output_id : null,
@@ -228,14 +320,29 @@ async function refreshTasks() {
       }
       if (version === displayedVersion && requestNumber < reportedRequest) return;
       if (stored !== version) accessVersionStorage(() => localStorage.setItem(versionKey, version));
+      versionFloor = version;
+      const pending = pendingRequests();
+      if (tasks?.some((task) => task.cancellation?.request_id !== pending[task.task_id])) {
+        markLastConfirmed("取消请求已变化，请刷新核对。");
+        return;
+      }
+      const signature = JSON.stringify(tasks?.map((task) => task.cancellation?.request_id));
+      const resolved = tasks?.filter((task) => ["completed", "failed", "cancelled"].includes(task.status)
+        && ["cancelled", "sealed", "ineligible"].includes(task.cancellation?.state)) ?? [];
+      if (resolved.length) {
+        for (const task of resolved) delete pending[task.task_id];
+        accessVersionStorage(() => localStorage.setItem(pendingKey, JSON.stringify(pending)));
+      }
       // 已显示的同版本只更新反馈。历史恢复重新构建卡片，丢弃旧输出和读取状态。
-      if (taskResults.hidden || version !== displayedVersion) {
+      if (taskResults.hidden || version !== displayedVersion || signature !== displayedPending
+          || actionButton?.disabled) {
+        actionButton = null;
         const cards = document.createDocumentFragment();
         for (const task of tasks ?? []) cards.append(taskCard(task, outputId));
         taskResults.replaceChildren(cards);
+        displayedPending = signature;
       }
       taskResults.hidden = false;
-      versionFloor = version;
       displayedVersion = version;
       reportedRequest = Math.max(requestNumber, reportedRequest);
       if (tasks === null) taskFeedback.textContent = "未找到该任务。";
@@ -263,6 +370,10 @@ refreshButton.addEventListener("click", refreshTasks);
 window.addEventListener("storage", (event) => {
   if (!checkTaskSession()) return;
   if (event.key === versionKey || event.key === null) return recheckVersionFloor();
+  if (event.key === pendingKey) {
+    markLastConfirmed("取消请求已变化，正在核对。");
+    return refreshTasks();
+  }
 });
 function checkVisibleSession() {
   if (document.visibilityState !== "visible" || pageSuspended || !checkTaskSession()) return;
