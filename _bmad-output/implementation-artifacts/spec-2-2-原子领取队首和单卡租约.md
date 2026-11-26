@@ -2,7 +2,7 @@
 title: 'Story 2.2 原子领取队首和单卡租约'
 type: 'feature'
 created: '2026-11-25'
-status: 'in-review'
+status: 'done'
 baseline_commit: 'e1421b92c614b3502784bb346cc7fa25c4232d78'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -66,6 +66,15 @@ context: ['{project-root}/AGENTS.md', '{project-root}/_bmad-output/project-conte
 - `uv run --locked pytest -q` 共 87 项通过，其中 Story 2.2 定向用例 20 项。
 - `node --test tests/submission_page.test.cjs tests/tasks_page.test.cjs` 共 33 项通过。
 - `uv run --locked ruff check .`、`uv run --locked python scripts/check_env.py` 和 Git 差异空白检查通过。启动检查使用 Python 3.12.15。Starlette 仍报告已有的 TestClient／httpx 弃用提示。
+
+### 2026-11-26 · 独立复审与自动回归
+
+用户确认独立复审基于 `0618f26dfb74b3fa2d59dc5fbc480f910bafe964`，结论为通过。两项已通过的临时验证已纳入全量测试。
+
+- [并发领取回归](../../tests/test_dispatch.py) 的 `lost_after_commit` 用例让第二个领取者实际遇到忙锁。首个领取者执行真实 SQLite COMMIT 后关闭连接并丢失回执。核对和重试后，A 只获准一次，租约历史只有一条，B 仍排队且队位为 1。
+- [跨组重启回归](../../tests/test_submissions.py) 分别设置 A、B 的确认时间相同和 B 的确认时间回拨 30 秒，并延迟 A 的回执。重启后 C 入队，仅 GPU 2 恢复可用。两种情况下均为 A 先领取，B、C 仍排队，队位分别为 1、2。
+
+Windows 本地双卡模拟全量检查通过。Python 88 项、Node 33 项全部通过，Ruff、本地启动检查和 Git 差异空白检查通过。Python 测试报告一条已有的 Starlette TestClient／httpx 弃用提示。
 
 ## 待联调
 

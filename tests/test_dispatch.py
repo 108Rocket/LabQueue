@@ -49,8 +49,9 @@ def owner_task(client, headers, task_id):
     return int(listing["snapshot_version"]), task
 
 
+@pytest.mark.parametrize("lose_reply", [False, True], ids=["acknowledged", "lost_after_commit"])
 def test_single_available_gpu_keeps_global_fifo_with_concurrent_claims(
-    client, database, monkeypatch
+    client, database, monkeypatch, lose_reply
 ):
     headers = login(client)
     body = payload(memory_gib=None)
@@ -69,14 +70,22 @@ def test_single_available_gpu_keeps_global_fifo_with_concurrent_claims(
     committing = Event()
     contended = Event()
     resume = Event()
-    first_finished = Event()
+    retry_allowed = Event()
+    reply_lost = Event()
 
     class PausedWriter(sqlite3.Connection):
         def execute(self, sql, parameters=()):
             if sql == "COMMIT":
                 committing.set()
                 assert resume.wait(timeout=10)
-            return super().execute(sql, parameters)
+            cursor = super().execute(sql, parameters)
+            if sql == "COMMIT" and lose_reply and not reply_lost.is_set():
+                # SQLite 已经提交。关闭写连接，迫使领取者按原 ID 核对回执。
+                self.close()
+                reply_lost.set()
+                retry_allowed.set()
+                raise sqlite3.OperationalError("synthetic lost claim reply")
+            return cursor
 
     class ContendingWriter(sqlite3.Connection):
         def execute(self, sql, parameters=()):
@@ -86,7 +95,7 @@ def test_single_available_gpu_keeps_global_fifo_with_concurrent_claims(
                 assert sql == "BEGIN IMMEDIATE"
                 assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
                 contended.set()
-                assert first_finished.wait(timeout=10)
+                assert retry_allowed.wait(timeout=10)
                 raise
 
     def create_writer(connection_type):
@@ -102,7 +111,7 @@ def test_single_available_gpu_keeps_global_fifo_with_concurrent_claims(
         try:
             return first.claim_head()
         finally:
-            first_finished.set()
+            retry_allowed.set()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         leading = pool.submit(leading_claim)
@@ -125,6 +134,7 @@ def test_single_available_gpu_keeps_global_fifo_with_concurrent_claims(
             resume.set()
         admitted = leading.result(timeout=10)
         assert following.result(timeout=10) == ClaimBlocked("gpu_busy")
+    assert reply_lost.is_set() == lose_reply
     assert first.claim_head() == second.claim_head() == ClaimBlocked("gpu_busy")
     assert isinstance(admitted, ClaimedLease)
     assert (admitted.task_id, admitted.gpu_uuid) == (earlier["task_id"], GPU_1)
