@@ -1,4 +1,4 @@
-"""LabQueue 的本地模拟提交入口。"""
+"""LabQueue 的本地模拟应用。"""
 
 import json
 import secrets
@@ -105,6 +105,7 @@ def create_app(database_path: Path | None = None) -> FastAPI:
         ):
             raise RuntimeError("检测到旧任务库，请先停服并将 SQLite 备份迁入账号私有目录")
         app.state.observations = store.initialize()
+        app.state.claim_head = store.claim_head
         app.state.sessions = DemoSessions()
         yield
 

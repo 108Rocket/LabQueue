@@ -11,6 +11,9 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 from uuid import uuid4
 
+from labqueue.leases import dispatch_options, revoke_occupied_leases
+from labqueue.storage import rollback_open_transaction
+
 SIMULATED_GPU_UUIDS = (
     "GPU-6c61338a-4bc7-4a97-a6a4-293caa9f8601",
     "GPU-6c61338a-4bc7-4a97-a6a4-293caa9f8602",
@@ -96,9 +99,23 @@ def _advance_snapshot_version(db: sqlite3.Connection) -> None:
     db.execute("UPDATE queue_state SET snapshot_version = snapshot_version + 1 WHERE id = 1")
 
 
-def _save(db: sqlite3.Connection, before: AdmissionState, after: AdmissionState) -> None:
+def _save(
+    db: sqlite3.Connection,
+    before: AdmissionState,
+    after: AdmissionState,
+    *,
+    occupied_uuids: tuple[str, ...] = (),
+) -> None:
     if before == after:
         return
+    affects_dispatch = (
+        bool(occupied_uuids)
+        or before.waiting_reason != after.waiting_reason
+        or before.candidate_uuids != after.candidate_uuids
+        or before.admission_generation != after.admission_generation
+    )
+    if affects_dispatch:
+        old_reason = dispatch_options(db, before).waiting_reason
     gpu_1, gpu_2 = SIMULATED_GPU_UUIDS
     db.execute(
         """UPDATE gpu_admission_state
@@ -113,7 +130,9 @@ def _save(db: sqlite3.Connection, before: AdmissionState, after: AdmissionState)
             after.publication_attempt_id,
         ),
     )
-    if before.waiting_reason != after.waiting_reason:
+    if occupied_uuids:
+        revoke_occupied_leases(db, occupied_uuids)
+    if affects_dispatch and old_reason != dispatch_options(db, after).waiting_reason:
         _advance_snapshot_version(db)
 
 
@@ -183,6 +202,14 @@ def _expire(state: AdmissionState) -> AdmissionState:
     return state
 
 
+def read_admission_for_claim(db: sqlite3.Connection) -> AdmissionState:
+    """持有写权时复核时效，必要时同事务封闭旧代际。"""
+    before = read_admission(db)
+    current = _expire(before)
+    _save(db, before, current)
+    return current
+
+
 def _sample_result(
     clock: int, token: CollectionToken, reports: Mapping[str, Occupancy] | None
 ) -> tuple[WaitingReason, tuple[str, ...]]:
@@ -246,24 +273,13 @@ class SimulatedObservations:
                 raise
             (commit or self._commit)(db)
 
-    @staticmethod
-    def _rollback_open_transaction(db: sqlite3.Connection) -> bool:
-        try:
-            if db.in_transaction:
-                db.execute("ROLLBACK")
-                return True
-        except sqlite3.Error:
-            # 原连接可能已关闭，须由调用方从持久状态核对提交结果。
-            pass
-        return False
-
     def _commit(
         self, db: sqlite3.Connection, reconcile: Callable[[], bool] | None = None
     ) -> None:
         try:
             db.execute("COMMIT")
         except sqlite3.Error:
-            if self._rollback_open_transaction(db) or reconcile is None:
+            if rollback_open_transaction(db) or reconcile is None:
                 raise
             db.close()
             if not reconcile():
@@ -288,7 +304,7 @@ class SimulatedObservations:
         try:
             db.execute("COMMIT")
         except sqlite3.Error as error:
-            if self._rollback_open_transaction(db):
+            if rollback_open_transaction(db):
                 return False
             db.close()
             try:
@@ -399,5 +415,9 @@ class SimulatedObservations:
                 candidate_uuids=candidates,
                 publication_attempt_id=attempt_id,
             )
-            _save(db, before, after)
+            occupied = (
+                tuple(gpu_uuid for gpu_uuid in SIMULATED_GPU_UUIDS if gpu_uuid not in candidates)
+                if _valid_observation(after) else ()
+            )
+            _save(db, before, after, occupied_uuids=occupied)
         return committed

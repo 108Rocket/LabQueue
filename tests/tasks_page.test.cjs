@@ -195,6 +195,28 @@ for (const detail of [false, true]) {
     assert.equal(shared.values.get(versionKey), "6");
   });
 
+  test(`${view}显示原序回队原因和已获准状态，拒绝迟到的排队快照`, async () => {
+    const page = makePage(detail);
+    page.reply(0, snapshot(detail, "1", {
+      queue_position: 1, waiting_reason: "requeue_required",
+    }));
+    await settle();
+    assert.match(page.rows(), /全局队位 1/);
+    assert.match(page.rows(), /有更早的任务需先按原序回队/);
+
+    const old = page.refresh();
+    const admitted = page.refresh();
+    page.reply(2, snapshot(detail, "3", {
+      status: "admitted", queue_position: null, waiting_reason: null,
+    }));
+    await admitted;
+    page.reply(1, snapshot(detail, "2", { queue_position: 1 }));
+    await old;
+    assert.match(page.rows(), /已获准/);
+    assert.doesNotMatch(page.rows(), /全局队位|回队|取消任务/);
+    assert.equal(page.feedback(), "已更新任务。");
+  });
+
   test(`${view}拒绝缺版本、不可比较版本或不完整的快照`, async () => {
     const shared = makeSharedVersionStore();
     const page = makePage(detail, shared);

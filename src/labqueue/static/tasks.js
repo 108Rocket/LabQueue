@@ -7,10 +7,11 @@ const taskFeedback = byId("tasks-feedback");
 const taskResults = byId("task-results");
 const refreshButton = byId("refresh-tasks");
 const waitingReasons = {
-  gpu_busy: "两张模拟 GPU 均被占用。",
+  gpu_busy: "两张模拟 GPU 均被占用或已保留。",
   gpu_monitoring_failed: "模拟 GPU 监测失败，暂停派发。",
   gpu_observation_expired: "模拟 GPU 观测已过期，暂停派发。",
   gpu_visibility_unknown: "模拟 GPU 占用状态待确认。",
+  requeue_required: "有更早的任务需先按原序回队。",
   waiting_dispatch: "等待调度。",
 };
 const decimalVersion = /^(?:0|[1-9][0-9]*)$/;
@@ -130,7 +131,8 @@ function taskCard(task, outputId) {
   }
   const queued = task.status === "queued";
   const status = document.createElement("p");
-  status.textContent = queued ? `排队中 · 全局队位 ${task.queue_position}` : "已离开队列";
+  if (queued) status.textContent = `排队中 · 全局队位 ${task.queue_position}`;
+  else status.textContent = task.status === "admitted" ? "已获准" : "已离开队列";
   card.append(heading, status);
   if (queued) {
     const reason = document.createElement("p");

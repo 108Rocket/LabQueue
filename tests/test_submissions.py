@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 import labqueue.submissions as submissions
 from labqueue.app import create_app, require_csrf
 from labqueue.auth import VIEW_SCOPE_COOKIE, Session
+from labqueue.leases import ClaimBlocked, ClaimedLease
 from labqueue.observations import (
     OBSERVATION_TTL_SECONDS,
     SIMULATED_GPU_UUIDS,
@@ -1069,6 +1070,22 @@ def test_cross_group_positions_follow_commit_order_after_reverse_receipts_and_re
         assert (latest["task_id"], latest["queue_position"], latest["waiting_reason"]) == (
             third["task_id"], 3, "gpu_monitoring_failed"
         )
+
+        claim = restarted.app.state.claim_head
+        assert claim() == ClaimBlocked("gpu_monitoring_failed")
+        publish(restarted, {GPU_1: "busy", GPU_2: "idle"})
+        lease = claim()
+        assert isinstance(lease, ClaimedLease)
+        assert (lease.task_id, lease.gpu_uuid) == (first["task_id"], GPU_2)
+        assert claim() == ClaimBlocked("gpu_busy")
+        remaining = restarted.get("/api/tasks", headers=headers).json()["tasks"]
+        positions = [
+            (task["task_id"], task["status"], task["queue_position"]) for task in remaining
+        ]
+        assert positions == [
+            (second["task_id"], "queued", 1),
+            (third["task_id"], "queued", 2),
+        ]
 
 
 def test_task_pages_and_api_are_owner_scoped(client):
